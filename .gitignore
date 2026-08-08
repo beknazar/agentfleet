@@ -1,0 +1,17 @@
+# Local machine config - never commit. This is where your hostnames, usernames
+# and paths live; the repo ships only agentfleet.conf.example.
+agentfleet.conf
+*.local.conf
+
+# Anything that even smells like a credential
+*.key
+*.pem
+*.pw
+*.secret
+.credentials.json
+auth.json
+
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store

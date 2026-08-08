@@ -1,0 +1,404 @@
+# agentfleet configuration
+#
+# Copy to ~/.config/agentfleet/config (or keep an agentfleet.conf next to a
+# project - a repo-local file wins). This is plain shell: it gets sourced, so
+# you can compute values if you want to.
+#
+# Nothing here is secret. Keys and tokens stay in your keychain, your vault, or
+# ~/.ssh - agentfleet only ever references them by path.
+
+# ---------------------------------------------------------------- the basics
+
+# Names the fleet. Used for the ssh key (~/.ssh/$AF_NAME), the generated ssh
+# config (~/.ssh/$AF_NAME.conf), and the systemd unit prefix on each machine.
+AF_NAME=agentfleet
+
+# ssh   - you bring the machines. No cloud account needed. List them below.
+# azure - agentfleet creates and destroys them for you (`agentfleet up`).
+AF_PROVIDER=ssh
+
+# provider=ssh only: the machines. Names here become the host names you use
+# everywhere (`agentfleet say w1 "..."`). Each must be resolvable by ssh, either
+# because it is a real DNS name, a tailnet name, an /etc/hosts entry, or a Host
+# block you already have in ~/.ssh/config. `agentfleet sshconfig` detects a name
+# you declared there yourself and leaves that block alone, so pointing AF_HOSTS
+# at an alias you already use keeps working.
+AF_HOSTS="w1 w2 w3"
+
+# The login user on the machines, and the ssh key to reach them with.
+AF_USER=ubuntu
+AF_KEY="$HOME/.ssh/agentfleet"
+
+# ---------------------------------------------------------------- the agent
+
+# Which coding agent runs on the machines. Affects the transcript reader that
+# powers the dashboard's "what is it doing" column.
+#   claude - Claude Code (~/.claude/projects/**/*.jsonl)
+#   codex  - Codex CLI   (~/.codex/sessions/**/*.jsonl)
+AF_AGENT=claude
+
+# Override the transcript search glob if your agent writes them somewhere else.
+# Empty means the default layout for AF_AGENT above. The newest match by mtime
+# wins, so a session started in any directory is visible, not just one repo.
+AF_STATUS_TRANSCRIPTS=""
+
+# Where the agent works. A repo here is cloned on provision and kept in sync.
+# Empty derives it as $AF_HOME/work, which follows AF_USER and AF_HOME without
+# you having to remember this line - set it only to put the work tree elsewhere.
+AF_WORKDIR=""
+AF_REPO=""
+
+# The branch every machine converges on. A machine checked out on anything else
+# is skipped by `sync` and left completely alone, so parking one on a job branch
+# is a supported thing to do.
+AF_REPO_BRANCH=main
+
+# The tmux session the agent lives in. `attach`, `say` and `run` target this.
+AF_SESSION=main
+
+# What `agentfleet run` executes for a detached job; the prompt is appended as
+# one argument. Empty means use the default for AF_AGENT, which hands the agent
+# full autonomy on the machine (claude: --permission-mode bypassPermissions,
+# codex: --dangerously-bypass-approvals-and-sandbox) on the assumption that the
+# machine itself is the sandbox. Set this to something narrower if it is not.
+AF_RUN_CMD=""
+
+# ---------------------------------------------------------------- status collector
+#
+# The per-machine collector runs on a timer and writes a small JSON cache
+# (status.json, and cost.json for token spend) that the dashboard reads. That is
+# what keeps a ten-machine page cheap: it reads files, it never makes the
+# machines think.
+#
+# `agentfleet provision` is what carries these to the machines - it writes them
+# to ~/.config/agentfleet/agent.env there. `agentfleet sync` does NOT, so after
+# changing anything in this section re-run `agentfleet provision <host|all>`,
+# which is idempotent and safe on an already-built machine.
+
+# How often the collector timer runs, in seconds. This is the resolution of the
+# whole dashboard: nothing can be fresher than this. Keep AF_SUMMARY_MIN_INTERVAL
+# ABOVE it, or every tick calls the summarizer model.
+AF_STATUS_INTERVAL=15
+
+# OPTIONAL one-line prose summary of what each agent is doing, written by a small
+# model. Everything else - the state, whether a machine needs you, what is still
+# running - is computed deterministically and works with this left off.
+#   none      - deterministic only, never makes a network call (the default)
+#   anthropic - Anthropic Messages API
+#   openai    - any OpenAI-compatible /chat/completions endpoint
+AF_SUMMARY_PROVIDER=none
+
+# Model id and endpoint. Empty means the provider's small-and-cheap default.
+AF_SUMMARY_MODEL=""
+AF_SUMMARY_URL=""
+
+# Where the API key lives ON THE MACHINE. A path, never the key itself. Empty
+# falls back to the provider's usual environment variable in the agent's shell.
+AF_SUMMARY_KEY_FILE=""
+
+# Minimum seconds between model calls per machine. The summarizer is called only
+# when the transcript has actually changed, and never by the dashboard, so an
+# idle machine costs nothing. It throttles the timer above, so anything at or
+# below AF_STATUS_INTERVAL summarizes every tick; raise it to spend less.
+AF_SUMMARY_MIN_INTERVAL=60
+
+# Token prices are a built-in static estimate and they drift. Point this at a
+# JSON file on the machine to correct them; see the table at the top of
+# agent/af-cost.py for the shape.
+AF_COST_PRICES=""
+
+# ---------------------------------------------------------------- path mirroring
+#
+# OPTIONAL, and the single best trick in here if you use it.
+#
+# Set AF_HOME to your LAPTOP's home path and provisioning will create the remote
+# user with that exact home directory - so /Users/you/... resolves identically on
+# the laptop and on a Linux box. Every absolute path in your agent's config,
+# skills, hooks and notes then works on both sides with no rewriting, and you can
+# rsync dotfiles across without a translation layer.
+#
+# Leave empty for the normal /home/$AF_USER.
+AF_HOME=""
+
+# ---------------------------------------------------------------- syncing
+
+# Extra paths pushed laptop -> machine on `agentfleet sync`. Relative to $HOME on
+# both ends. This is how your agent's config, skills and prompts get everywhere.
+AF_SYNC_PATHS="
+.claude/CLAUDE.md
+.claude/agents
+.claude/commands
+.claude/skills
+"
+
+# Secrets distributed by `agentfleet secrets push`, one "name|path" per line,
+# path relative to $HOME. Files are transferred over ssh with mode 600 and never
+# appear on a command line. Read docs/security.md before enabling this.
+AF_SECRETS=""
+
+# Command run on each machine right after a config push, which must exit 0. A
+# config push is exactly the operation that can break the agent it configures,
+# so it is worth making the machine prove it still works: a failure is reported
+# loudly and the push is retried on the next run instead of being marked done.
+# Empty skips the check.
+AF_SYNC_HEALTHCHECK=""
+
+# Environment variables that must be non-empty in the agent's login shell,
+# checked after every config push. Worth setting if AF_SYNC_PATHS includes shell
+# startup files: one bad push can strip the API key the agent authenticates
+# with, and the only symptom is every agent quietly asking you to log in again.
+# Space separated names, not values.
+AF_REQUIRED_ENV=""
+
+# Commit whatever an agent left in the working tree and push it to your git
+# remote, unattended, on every sync. OFF by default, and think before turning it
+# on: it publishes everything in the tree that .gitignore does not exclude,
+# including files an agent downloaded or wrote. agentfleet refuses to stage
+# credential-shaped filenames and never passes --no-verify, so your pre-commit
+# hooks still run, but .gitignore and those hooks are the only guards. With this
+# off, only work an agent committed itself travels home.
+AF_AUTOCOMMIT=0
+
+# Tracked files that you rewrite per machine, for instance a config file
+# pointing at a service that lives on that machine. Never auto-committed, so a
+# per-machine rewrite cannot travel home and ten machines cannot fight over one
+# file. Repo-relative, one per line or space separated.
+AF_REPO_LOCAL_PATHS=""
+
+# Files bigger than this are left uncommitted with a warning instead. One
+# oversized artifact dropped by an agent otherwise blocks that machine's push
+# forever, and hosted git remotes reject pushes carrying blobs over 100MB.
+AF_MAX_BLOB_MB=90
+
+# ---------------------------------------------------------------- machine toolchain
+#
+# What `agentfleet provision` installs on each machine. The core (tmux, git,
+# ripgrep, jq, python3, node, ttyd, your agent CLI) is not configurable - the
+# rest of the tool assumes it. These add to it.
+
+# How long to wait for a freshly created machine to become usable, in seconds.
+# Generous on purpose: several first boots at once hammer the same package
+# mirror, and giving up early just means giving up on a machine that was about
+# to work.
+AF_PROVISION_TIMEOUT=1200
+
+# Node version installed via nvm, and made available to non-login shells.
+AF_NODE_VERSION=22
+
+# Extra apt packages and extra npm globals, space separated. Your toolchain
+# goes here; nobody else's belongs in the default install.
+AF_PKG_EXTRA=""
+AF_NPM_EXTRA=""
+
+# ---------------------------------------------------------------- networking
+
+# auto - prefer a Tailscale address for every machine, fall back to the
+#        provider's public IP. Strongly recommended: cloud firewalls pinned to
+#        your current public IP break the moment you change wifi.
+# off  - always use the provider address.
+AF_TAILNET=auto
+
+# Path to a file holding a REUSABLE Tailscale auth key. With it, provisioning
+# joins each machine to your tailnet with no clicks; without it, provisioning
+# tells you to finish the join by hand. The file is read on the laptop and sent
+# over ssh into a mode-600 file, never onto a command line.
+AF_TS_AUTHKEY_FILE=""
+
+# Port for `agentfleet dash` on your laptop.
+AF_DASH_PORT=8788
+
+# What the dashboard listens on.
+#   tailnet - your Tailscale address, so your phone can reach it and nobody else
+#   local   - 127.0.0.1 only
+#   <addr>  - an explicit address
+# Think before widening this. Every authenticated request can type into a live
+# agent session, so this port is remote code execution on every machine in the
+# fleet, with one password in front of it. 0.0.0.0 on a shared network hands the
+# fleet to the room.
+AF_DASH_BIND=tailnet
+
+# Seconds `agentfleet ls` gives one machine to answer before printing it as
+# unreachable. It probes them all at once, so this is the longest the table can
+# ever take - one wedged machine must not decide how long you wait for the
+# other nine.
+AF_PROBE_TIMEOUT=8
+
+# Web terminal (ttyd) port on each machine, and the port the dashboard's per-row
+# "term" link points at. That link opens in YOUR browser, so it only resolves
+# from a network that can reach the machine directly (a tailnet does; the public
+# internet should not). Empty stops offering the link; the terminal still runs.
+# The "screen" link uses AF_NOVNC_PORT, down in the browser section.
+AF_TERM_PORT=7681
+
+# ---------------------------------------------------------------- dashboard
+#
+# Only read by `agentfleet dash`. The page itself is described at the top of
+# dashboard/server.mjs, including the JSON contract it reads off each machine.
+
+# Health checks rendered as the status dots on each row, one "key|check" per
+# line, where check is "unit:<systemd-user-unit>" or "port:<n>" (does anything
+# answer HTTP there). Only services listed here can raise an alarm: an unlisted
+# one reports "not configured" instead of a permanently red dot, and a check
+# that could not run is never counted as a pass.
+#
+# Empty means "watch the optional modules this config turned on" - the web
+# terminal, and the browser ports if AF_BROWSER or AF_MAC_CHROME are set. Set it
+# to add your own:
+#
+#   AF_DASH_SERVICES="
+#   ttyd|port:7681
+#   myworker|unit:my-worker
+#   "
+AF_DASH_SERVICES=""
+
+# Seconds a machine may have work in flight without its transcript moving before
+# the dashboard calls it stalled. A background shell or a subagent is healthy
+# work, not a problem: flagging those on sight puts every busy machine in the
+# "needs you" list and makes the count worthless. Stopped moving is the signal.
+AF_DASH_STALL_SEC=900
+
+# Memory percentage that counts as trouble. The default suits a machine with
+# tens of GB running several subagents at once; lower it on small machines.
+AF_DASH_MEM_PCT=88
+
+# ---------------------------------------------------------------- hardening
+
+# Swap file size in GB created on each machine. Coding agents spike hard; a
+# machine with no swap can wedge itself so badly you lose ssh.
+AF_SWAP_GB=16
+
+# Max concurrent subagents, exported into the remote shell. Empty does NOT mean
+# "skip": each machine then computes a cap from its own RAM (about one per 3GB,
+# floor 2) and writes it to /etc/profile.d/$AF_NAME-agent.sh. That is usually
+# what you want, because a fan-out tuned on a big laptop will freeze a small
+# machine. Set a number to override it.
+AF_SUBAGENT_CAP=""
+
+# Which processes earlyoom sacrifices first when memory runs out. The default
+# targets the runtimes an agent spawns, because they are both the biggest and
+# the cheapest to restart. Must contain no whitespace: systemd splits this into
+# the unit's arguments without re-parsing quotes. sshd, systemd, the tmux server
+# and the session bus are never targeted and that list is not configurable -
+# killing one of those loses you the machine instead of the job.
+AF_EARLYOOM_PREFER=""
+
+# ---------------------------------------------------------------- hooks
+
+# Run after provisioning finishes. Gets the host name as $1. Use it for whatever
+# your setup needs that agentfleet should not know about.
+AF_PROVISION_HOOK=""
+
+# A machine is not "ready" until this exits 0. Gets the host name as $1.
+# Provisioning fails loudly if it does not pass, which is what you want: a
+# half-configured agent machine is worse than an obviously broken one.
+AF_READY_HOOK=""
+
+# Optional URL POSTed by a machine when an `agentfleet run` job finishes, body
+# "agentfleet: <host>/<session> finished rc=N". Point it at whatever pages you.
+# Empty means the job just writes its result line and stops.
+AF_NOTIFY_URL=""
+
+# ---------------------------------------------------------------- browser module
+# Read by `agentfleet browser`, which starts (or repairs) a real browser on a
+# machine: Xvfb, Chromium with a debugging port your agent drives, x11vnc, and
+# noVNC so you can watch it work and take the mouse when it gets stuck.
+
+# 1 installs the browser packages while provisioning and keeps the whole stack
+# running as a systemd unit, so it survives a stop/start like everything else.
+# Off by default: it is a few hundred MB and most fleets never open it.
+AF_BROWSER=0
+
+# Debugging port the machine's Chromium listens on, and the noVNC web port you
+# open in your own browser. AF_NOVNC_PORT is also where the dashboard's per-row
+# "screen" link points; empty stops offering that link, the listener still runs.
+AF_CDP_PORT=9222
+AF_NOVNC_PORT=6080
+
+# Interface websockify binds the noVNC endpoint to. That desktop has NO password
+# and is a full session on the machine, so empty (the default) resolves to your
+# tailnet address, or to 127.0.0.1 when there is none. A wildcard (0.0.0.0, ::)
+# is refused outright. Set a specific address to serve somewhere else on purpose.
+AF_VNC_BIND=""
+
+# ---------------------------------------------------------------- laptop browser
+#
+# OFF, and think before turning it on.
+#
+# With this enabled, `agentfleet browser mac-chrome up <host>` reverse-tunnels a
+# DevTools port from your laptop onto a machine. Anything on that machine - your
+# agent, anything your agent runs, anyone with a shell there - can then drive
+# that browser: read and write its cookies, and act as you on every site it is
+# logged into. What it buys you is automation against real, already
+# authenticated sessions, without logging in from a datacenter IP and tripping
+# 2FA on every machine.
+#
+# It stays bounded because the tunnel is initiated FROM the laptop (nothing
+# listens on the laptop) and lands only on the machine's loopback interface.
+AF_MAC_CHROME=0
+
+# Loopback port the tunnel lands on, on the machine (`af-open -m` uses it).
+AF_MAC_CHROME_PORT=9223
+
+# Debug port of the dedicated browser profile on the laptop. This is a SEPARATE
+# profile, never your everyday one: current Chrome refuses the debug port on the
+# default profile and only lets you attach through a consent dialog on every
+# attach, and a separate profile also means an agent cannot touch the tabs you
+# are working in. Log in inside that window once; it persists.
+AF_MAC_CHROME_LOCAL_PORT=9333
+
+# Browser binary for that profile. Empty means "find Chrome or Chromium".
+AF_CHROME_BIN=""
+
+# Value for --remote-allow-origins on that profile. Leave EMPTY unless a
+# specific CDP client demands it, and then name that exact origin: with '*' any
+# page open in any browser on your laptop can connect to the debug port and
+# drive the logged-in profile.
+AF_MAC_CHROME_ORIGINS=""
+
+# ---------------------------------------------------------------- drop and clipboard
+#
+# `agentfleet drop` copies a file into $AF_HOME/drop on the machines and prints
+# the path that works there - a path you paste into a remote agent session
+# points at the laptop's filesystem, so the agent cannot read it.
+
+# Where `agentfleet drop` with no argument looks for the newest file. Point it
+# at wherever your screenshots land.
+AF_DROP_SRC="$HOME/Screenshots"
+
+# Optional clipboard bridge (agent/clipboard.sh): text copied inside a remote
+# tmux lands on this laptop's clipboard. AF_CLIP_HOST is how the machines reach
+# your laptop - a tailnet name or address. Empty disables the whole thing.
+AF_CLIP_HOST=""
+AF_CLIP_PORT=8899
+
+# Interface the bridge listens on. It has NO authentication: anything that can
+# reach the port can read and write your clipboard and open URLs in your
+# browser. Empty means "the tailnet address", and the bridge refuses to start if
+# there is no tailnet rather than falling back to something public.
+AF_CLIP_BIND=""
+
+# ---------------------------------------------------------------- azure
+# Only read when AF_PROVIDER=azure.
+
+AF_AZ_GROUP=agentfleet
+AF_AZ_REGION=westus2
+AF_AZ_SIZE=Standard_D8as_v5
+AF_AZ_IMAGE="Canonical:ubuntu-24_04-lts:server:latest"
+AF_AZ_DISK_GB=200
+
+# Lock the SSH firewall rule to your current public IP on create. Safer, but the
+# rule then points at the IP you had at create time: after changing networks,
+# re-point it with `agentfleet unlock [host...]`. With AF_TAILNET=auto this costs
+# you nothing day to day, because ssh goes over the tailnet anyway.
+AF_AZ_LOCK_SSH=1
+
+# Where to ask what your current public IP is, for the rule above. Any service
+# that answers with a bare address works. Creation fails rather than leaving a
+# machine open to the internet if this cannot be reached.
+AF_AZ_IP_URL="https://api.ipify.org"
+
+# Role granted to each machine's managed identity, scoped to AF_AZ_GROUP only.
+# The identity is what lets `az login --identity` work on the machine with no
+# interactive login. Reader is enough to look things up; widen it to Contributor
+# only if your agents actually need to change cloud resources.
+AF_AZ_IDENTITY_ROLE=Reader

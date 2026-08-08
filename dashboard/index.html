@@ -1,0 +1,1056 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>agentfleet</title>
+<style>
+/* Instrument panel, not a SaaS dashboard: one dense readout, left-aligned,
+   no cards, no gradients. Sky is the only accent; amber and rust appear ONLY
+   when something is actually wrong.
+
+   The row answers one question in reading order: WHAT IS THIS MACHINE DOING.
+   State word first, then a plain-English summary, then the raw prompt beneath
+   it for provenance. The raw prompt is evidence, never the headline - it is
+   routinely an image marker or a half-sentence and it told the operator
+   nothing.
+
+   System fonts on purpose: this page is a control plane for machines you may
+   be reaching over a private network from a plane. It must render with no
+   external request, and a webfont would also tell a third party every time you
+   look at your own fleet. */
+:root{
+  --ink:#0b1017; --rule:#1e2a40; --hair:#131c2c;
+  --lift:#0d1421; --hover:#111a2b; --lift-hover:#141e33;
+  --text:#e8eef8; --muted:#8a9cb4;
+/* --dim is the contrast floor: anything a person actually reads uses --muted or
+   --dim, and this is the dimmest value that still clears 4.5:1 on the ink
+   ground. Nothing below it is allowed to carry words. */
+  --dim:#6e7f99;
+  --sky:#93b6f2; --sky-soft:#dbe6f4; --sky-dim:#4a6da8;
+  --good:#7fb08a; --warn:#d9a441; --bad:#cf6a5a;
+/* Four sizes, not eight. A dense readout wants a compressed scale - pushing
+   1.25x between every step would shout - but eight near-identical sizes is
+   noise, not hierarchy. --t3 labels, --t2 secondary, --t1 data, --t0 title. */
+  --t0:1.2rem; --t1:.95rem; --t2:.8rem; --t3:.68rem;
+  --pad:clamp(.9rem,2.5vw,2.25rem);
+  --dw-w:min(38rem,46vw);
+  --ease:cubic-bezier(.16,1,.3,1);
+  --font:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--ink);color:var(--text)}
+body{font:400 15px/1.45 var(--font);-webkit-font-smoothing:antialiased}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+:focus-visible{outline:2px solid var(--sky-dim);outline-offset:2px}
+
+#page{padding:var(--pad) var(--pad) 7rem;max-width:1600px;margin-inline:auto}
+
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:.4rem 1.25rem;
+  padding-bottom:.9rem;border-bottom:1px solid var(--rule)}
+h1{font-size:var(--t0);font-weight:600;letter-spacing:-.01em;margin:0}
+h1 span{color:var(--dim);font-weight:300}
+.vitals{color:var(--muted);font-size:var(--t2);display:flex;gap:1.1rem;flex-wrap:wrap;margin-left:auto;align-items:baseline}
+.vitals b{color:var(--sky-soft);font-weight:500}
+.vitals .alarm{color:var(--warn)}
+.vitals .stale{color:var(--warn)}
+#stamp{font:inherit;color:var(--muted);background:none;border:0;padding:0;cursor:pointer;text-align:left}
+#stamp:hover{color:var(--sky)}
+
+#flash{display:none;margin-top:.7rem;color:var(--warn);font-size:var(--t2)}
+#flash[data-on]{display:block}
+
+table{width:100%;border-collapse:collapse;margin-top:.35rem}
+thead th{position:sticky;top:0;background:var(--ink);z-index:2;
+  font-size:var(--t3);font-weight:500;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--dim);text-align:left;padding:.85rem .55rem .5rem;border-bottom:1px solid var(--rule);white-space:nowrap}
+tbody td{padding:.55rem .55rem;border-bottom:1px solid var(--hair);vertical-align:top}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--hover)}
+/* attention is a lift and a colored state word, never a banner. The group
+   boundary is one rule - loud enough to find, quiet enough to live with. */
+tbody tr.att{background:var(--lift)}
+tbody tr.att:hover{background:var(--lift-hover)}
+tbody tr.att-last td{border-bottom-color:var(--rule)}
+tbody tr.down{opacity:.55}
+tbody tr.sel{background:var(--lift-hover);box-shadow:inset 1px 0 0 var(--sky)}
+td.num{text-align:right}
+
+.c-vm{font-weight:600;letter-spacing:-.01em}
+.c-vm small{display:block;color:var(--dim);font-weight:400;font-size:var(--t3);letter-spacing:.02em}
+
+/* state: the scan column. One word, one mark, colored only by urgency, with
+   time-since directly beneath - "waiting on you" means nothing without it -
+   and under that the work actually in flight, as counters. */
+.c-state{white-space:nowrap}
+.cost{font-family:var(--mono);font-variant-numeric:tabular-nums;
+  color:var(--muted);cursor:help;border-bottom:1px dotted var(--rule)}
+.cost.hot{color:var(--sky-soft)}
+.c-state .since,.c-state .work{display:block;color:var(--dim);font-size:var(--t3);
+  margin:.12rem 0 0 1.12rem;overflow:hidden;text-overflow:ellipsis;max-width:13rem}
+.st{display:inline-flex;align-items:center;gap:.42rem;font-size:var(--t2);color:var(--muted)}
+.mk{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.st-working{color:var(--sky)} .st-working .mk{animation:p 1.6s cubic-bezier(.4,0,.6,1) infinite}
+.st-waiting_for_human{color:var(--warn)}
+.st-blocked{color:var(--bad)}
+.st-error{color:var(--bad)}
+.st-done{color:var(--good)}
+.st-idle{color:var(--muted)} .st-idle .mk{background:none;box-shadow:inset 0 0 0 1px currentColor}
+.st-unknown{color:var(--muted)} .st-unknown .mk{background:none;box-shadow:inset 0 0 0 1px currentColor}
+.st-off{color:var(--dim)} .st-off .mk{background:none;box-shadow:inset 0 0 0 1px currentColor}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.25}}
+/* the only entrance in the product: a state word that just changed */
+@keyframes lift{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+.st.changed{animation:lift .32s var(--ease)}
+@media (prefers-reduced-motion:reduce){.st-working .mk{animation:none}.st.changed{animation:none}}
+
+/* activity: summary leads, raw prompt is the footnote under it */
+.c-act{min-width:15rem;width:100%}
+.sum{display:block;color:var(--text);font-size:var(--t1);line-height:1.35;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sum.none{color:var(--dim)}
+.needs{display:block;color:var(--warn);font-size:var(--t2);margin-top:.16rem;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task{display:block;color:var(--dim);font-size:var(--t3);margin-top:.16rem;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task::before{content:'asked: ';opacity:.7}
+
+/* memory as a hairline bar under the number: the one thing that must be
+   readable at a glance, because a starved machine freezes itself out of ssh
+   and then no other tool here can reach it either */
+.mem{display:flex;flex-direction:column;gap:.28rem;min-width:6.5rem}
+.mem .v{font-size:var(--t2)}
+.bar{height:2px;background:#1a2438;position:relative;overflow:hidden}
+/* scaleX, not width: width animation thrashes layout on every poll (ten rows,
+   every few seconds). transform stays on the compositor. */
+.bar i{position:absolute;inset:0;transform-origin:left;background:var(--sky-dim);
+  transition:transform .5s var(--ease)}
+@media (prefers-reduced-motion:reduce){.bar i{transition:none}}
+.bar.warn i{background:var(--warn)} .bar.bad i{background:var(--bad)}
+
+.quiet{color:var(--muted);font-size:var(--t2)}
+.c-repo{font-size:var(--t2)}
+.repo{font-size:var(--t2)}
+.repo.dirty{color:var(--sky-soft)}
+
+.dots{display:flex;gap:.34rem;align-items:center}
+.dot{width:6px;height:6px;border-radius:50%;background:#22304a}
+.dot.on{background:var(--good)} .dot.off{background:var(--bad)}
+
+/* empty state teaches the interface: the page is useless until there are
+   machines, so it says which command makes one instead of showing a blank grid */
+.empty{color:var(--muted);font-size:var(--t2);line-height:1.7;padding:1.6rem .55rem}
+.empty b{display:block;color:var(--text);font-size:var(--t1);font-weight:500;margin-bottom:.35rem}
+.empty code{font-family:var(--mono);color:var(--sky-soft)}
+
+.c-go{white-space:nowrap}
+/* Shrink every column but the summary to its content. Scoped to the table
+   layout: below 820px the row is a grid and a percentage width there resolves
+   against the grid area, collapsing the cell and letting its nowrap contents
+   hang off the right edge of the phone. */
+@media (min-width:821px){
+  .c-vm,.c-state,.c-mem,.c-repo,.c-svc,.c-go{width:1%}
+  .c-mem,.c-repo,.c-svc{white-space:nowrap}
+  .c-vm{white-space:nowrap}
+  .c-go{text-align:right}
+}
+.go{display:flex;gap:.15rem;justify-content:flex-end;align-items:center}
+button{font:inherit;font-size:var(--t2);color:var(--muted);background:none;border:1px solid transparent;
+  padding:.3rem .5rem;cursor:pointer;border-radius:0;transition:color .15s,border-color .15s,background-color .15s}
+button:hover{color:var(--text);border-color:var(--rule)}
+/* Consequence is legible before the click, not after it. Sky = steer, amber =
+   interrupts the turn in flight, plain = machine upkeep, rust = throws work
+   away. A control that costs nothing and a control that kills a session must
+   never look alike, so only two of the four carry colour at rest. */
+button.primary{color:var(--sky-soft);border-color:var(--sky-dim);background:#131e34}
+button.primary:hover{border-color:var(--sky);color:#fff}
+button.sky{color:var(--sky);border-color:rgba(147,182,242,.24)}
+button.sky:hover{color:var(--sky-soft);border-color:var(--sky-dim);background:#101a2c}
+button.caution{color:var(--warn);border-color:rgba(217,164,65,.24)}
+button.caution:hover{color:#eac06a;border-color:var(--warn);background:#1b1509}
+button.danger{color:var(--bad);border-color:rgba(207,106,90,.26)}
+button.danger:hover{color:#e5887a;border-color:var(--bad);background:#1d0f0d}
+button:disabled,button:disabled:hover{color:var(--dim);cursor:default;border-color:transparent;background:none}
+a.link{color:var(--muted);text-decoration:none;font-size:var(--t2);padding:.3rem .5rem;border:1px solid transparent;display:inline-block}
+a.link:hover{color:var(--sky);border-color:var(--rule)}
+.chev{color:var(--dim);flex:none;margin-left:.2rem}
+tbody tr:hover .chev,tbody tr.sel .chev{color:var(--sky)}
+
+/* ---------------------------------------------------------------- drawer
+   A dock, not a modal: on desktop the table stays lit and clickable behind it,
+   so clicking the next row swaps the panel instead of forcing a close. On a
+   phone there is no "behind", so it becomes a sheet with a scrim. */
+#scrim{position:fixed;inset:0;background:#05080d;opacity:0;pointer-events:none;
+  transition:opacity .22s var(--ease);z-index:30}
+body.dw #scrim{pointer-events:auto}
+#dw{position:fixed;top:0;right:0;bottom:0;width:var(--dw-w);z-index:40;
+  background:#080d15;border-left:1px solid var(--rule);
+  box-shadow:-24px 0 56px -18px rgba(0,0,0,.75);
+  /* head, lead, transcript, then the controls - in that order, because the
+     transcript ends at the newest line and the place you type is directly
+     under it, exactly like the terminal this is a window onto. */
+  display:grid;grid-template-rows:auto auto 1fr auto auto;
+  transform:translateX(101%);transition:transform .24s var(--ease);
+  overscroll-behavior:contain}
+body.dw #dw{transform:none}
+@media (prefers-reduced-motion:reduce){#dw,#scrim{transition:none}}
+#dw[hidden]{display:none}
+
+.dw-head{display:flex;align-items:flex-start;gap:1rem;padding:calc(var(--pad) * .7) 1.1rem .7rem;
+  border-bottom:1px solid var(--rule)}
+.dw-head h2{margin:0;font-size:var(--t0);font-weight:600;letter-spacing:-.01em}
+.dw-head .sub{color:var(--muted);font-size:var(--t3);margin-top:.2rem;line-height:1.5}
+.dw-head .sub b{color:var(--sky-soft);font-weight:500}
+#dw-close{margin-left:auto;flex:none}
+
+.dw-lead{padding:.8rem 1.1rem;border-bottom:1px solid var(--rule)}
+.dw-lead .sum{white-space:normal;font-size:var(--t1);line-height:1.45}
+.dw-lead .needs{white-space:normal;margin-top:.35rem}
+.dw-lead .work{display:block;color:var(--dim);font-size:var(--t2);margin-top:.4rem;line-height:1.45}
+.dw-lead .task{white-space:normal;margin-top:.4rem;font-size:var(--t2)}
+
+/* Controls grouped by what they cost, escalating downward: steer, then the two
+   verbs that stop the agent mid-turn, then machine upkeep, then the one that
+   throws work away. The gutter word says why the row is its own row - it is a
+   caption, not a heading, so it stays at label size and dim. */
+.grp{display:grid;grid-template-columns:4.75rem 1fr;align-items:center;gap:.55rem;
+  padding:.45rem 1.1rem;margin:0}
+.grp .lbl{font-size:var(--t3);letter-spacing:.09em;text-transform:uppercase;color:var(--dim)}
+.grp .btns{display:flex;flex-wrap:wrap;gap:.25rem;min-width:0}
+#dw-ctl .grp + .grp{border-top:1px solid var(--hair)}
+#dw-ctl{padding-bottom:calc(.4rem + env(safe-area-inset-bottom))}
+/* the stop row is not one more row of the same kind */
+#dw-ctl .grp.kill{border-top:1px solid var(--rule);margin-top:.3rem}
+
+#dw-log{overflow:auto;padding:.9rem 1.1rem 1.2rem;overscroll-behavior:contain}
+.tx{padding:.4rem 0;border-bottom:1px solid #0f1725}
+.tx:last-child{border-bottom:0}
+.tx .who{font-size:var(--t3);letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  display:flex;gap:.6rem;align-items:baseline}
+.tx .who time{margin-left:auto;text-transform:none;letter-spacing:0;font-size:var(--t3)}
+.tx p{margin:.22rem 0 0;font-size:var(--t2);line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.tx.user .who{color:var(--sky)} .tx.user p{color:var(--sky-soft)}
+.tx.assistant p{color:var(--text)}
+.tx.tool{border-bottom:0;padding:.1rem 0}
+.tx.tool .row{display:flex;gap:.55rem;align-items:baseline;font-size:var(--t3);color:var(--muted);
+  font-family:var(--mono)}
+.tx.tool .row b{color:var(--dim);font-weight:400}
+.tx.tool .row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.8}
+/* timestamps line up in one right-hand column whether the turn is a tool run
+   or a sentence - a ragged time column is unreadable at a glance */
+.tx.tool .row time{margin-left:auto;flex:none;padding-left:.6rem;font-family:var(--font)}
+
+.tx.clamped p{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.tx.clamped{cursor:pointer}
+.tx .more{font-size:var(--t3);color:var(--sky-dim)}
+.tx.open p{-webkit-line-clamp:unset;display:block}
+.tx.open .more{display:none}
+.tx.tool .row{opacity:.65}
+#dw-say{padding-top:.65rem;padding-bottom:.55rem;border-top:1px solid var(--rule);background:#080d15}
+#dw-say .btns{gap:.35rem}
+#dw-input{flex:1 1 9rem;min-width:0;font:inherit;font-size:var(--t2);padding:.55rem .65rem;
+  background:#101725;border:1px solid var(--rule);color:var(--text);border-radius:0}
+#dw-input::placeholder{color:var(--muted);opacity:.75}
+#dw-input:focus{outline:none;border-color:var(--sky-dim)}
+
+/* ---------------------------------------------------------------- jobs */
+#log{position:fixed;left:0;right:0;bottom:0;background:#080c13;border-top:1px solid var(--rule);
+  padding:.5rem var(--pad) calc(.5rem + env(safe-area-inset-bottom));max-height:32vh;overflow:auto;
+  font-size:var(--t2);z-index:20}
+body.dw #log{right:var(--dw-w)}
+#log:empty{display:none}
+#log div.j{display:flex;gap:.7rem;padding:.16rem 0;color:var(--muted)}
+#log b{color:var(--sky-soft);font-weight:500;min-width:5.5rem}
+#log .st-running{color:var(--warn)} #log .st-done{color:var(--good)} #log .st-failed{color:var(--bad)}
+#log pre{margin:.2rem 0 .5rem;color:var(--muted);white-space:pre-wrap;font-size:var(--t3);max-height:8rem;overflow:auto;opacity:.85}
+
+/* PHONE: a wide table cannot be shrunk onto a phone, so it stops being a table.
+   Each machine becomes a two-column block - name and state on one line because
+   that is the glance, summary full width beneath it, then numbers and controls
+   with thumb-sized targets. Nothing is hidden: adapt the interface, never
+   amputate. */
+@media (max-width:820px){
+  :root{--dw-w:100vw}
+  #page{padding-bottom:8rem}
+  thead{display:none}
+  table,tbody{display:block;width:100%}
+  /* Four lines per machine: name + state, the summary, one facts line, the
+     controls. The column headers left with the table, so the micro-labels go
+     too - a bar of free memory and a row of service dots do not need to be told
+     apart, and stacking MEMORY / REPO / SERVICES as their own labelled rows
+     turned one glanceable box into three quarters of a phone screen. */
+  /* minmax(0,...) on every track: an auto track refuses to go below its
+     max-content, and one dirty repo ("4 uncommitted · 2 to push") then pushes
+     the whole page wider than the phone and puts a horizontal scrollbar under a
+     fixed drawer. Tracks shrink; the text inside them ellipsizes. */
+  tbody tr{display:grid;grid-template-columns:minmax(0,auto) minmax(0,1fr) minmax(0,auto);
+    column-gap:.7rem;align-items:start;
+    border-bottom:1px solid var(--rule);padding:.85rem .2rem}
+  tbody tr:hover{background:none}
+  tbody tr.att{background:var(--lift);margin-inline:-.2rem;padding-inline:.4rem}
+  tbody td{display:block;border:0;padding:0;width:auto;white-space:normal}
+  .c-vm{grid-area:1/1/2/2;align-self:baseline;font-size:var(--t1)}
+  /* spend rides on the name line. Every cell needs an explicit area here or it
+     is auto-placed into a row of its own, and a bare dollar amount stranded
+     under the buttons reads as a stray number rather than today's spend. */
+  .c-cost{grid-area:1/2/2/3;align-self:baseline;padding-left:.4rem;
+    overflow:hidden;text-overflow:ellipsis}
+  .c-state{grid-area:1/3/2/4;justify-self:end;align-self:baseline;text-align:right}
+  .c-state .since,.c-state .work{margin-left:0;max-width:9rem}
+  .c-act{grid-area:2/1/3/4;margin:.3rem 0 .6rem}
+  .c-mem{grid-area:3/1/4/2;align-self:center;white-space:nowrap}
+  .c-repo{grid-area:3/2/4/3;align-self:center;white-space:nowrap;padding-left:.25rem;
+    overflow:hidden;text-overflow:ellipsis}
+  .c-svc{grid-area:3/3/4/4;justify-self:end;align-self:center}
+  .c-go{grid-area:4/1/5/4;text-align:left;margin-top:.65rem}
+  .sum,.needs,.task{white-space:normal}
+  .mem{flex-direction:row;align-items:center;gap:.5rem;min-width:0}
+  .mem .v{overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .mem .bar{width:2.5rem;flex:none}
+  .go{justify-content:flex-start;gap:.35rem}
+  .chev{box-sizing:content-box;padding:.7rem .45rem;margin-left:.25rem}
+  /* thumb targets only where a thumb aims: the row controls and the drawer.
+     Applying this to every button also inflated the header timestamp. */
+  .go button,.go a.link,.grp button,#dw-close{
+    padding:.6rem .85rem;min-height:44px;display:inline-flex;align-items:center}
+  /* an outline so a bare control is findable by thumb - but only on the ones
+     that have no colour of their own, or the hierarchy dies on the phone */
+  .go button,.go a.link,#dw-close,.grp button:not([class]){border-color:var(--hair)}
+  #dw{border-left:0;border-top:1px solid var(--rule);top:auto;height:min(94dvh,100dvh);
+    transform:translateY(101%);box-shadow:0 -24px 56px -18px rgba(0,0,0,.8)}
+  body.dw #scrim{opacity:.55}
+  body.dw #log{right:0}
+  /* the gutter caption keeps working on a phone; it just gets narrower, which
+     is cheaper than stacking four more caption lines above four button rows */
+  .grp{grid-template-columns:3.6rem 1fr;gap:.45rem;padding-inline:.9rem}
+  .grp button{min-height:44px}
+  #dw-input{min-height:44px;font-size:16px} /* 16px: anything smaller zooms iOS on focus */
+}
+</style>
+</head>
+<body>
+<div id="page">
+<header>
+  <h1>agentfleet <span id="count"></span></h1>
+  <div class="vitals" id="vitals"></div>
+</header>
+<p id="flash"></p>
+
+<table>
+<thead><tr>
+  <th>Machine</th><th>State</th><th>Doing</th><th>Memory</th><th>Spend</th><th>Repo</th><th>Services</th><th></th>
+</tr></thead>
+<tbody id="rows"><tr><td colspan="8" class="quiet" id="boot">probing the fleet…</td></tr></tbody>
+</table>
+</div>
+
+<div id="log"></div>
+
+<div id="scrim"></div>
+<aside id="dw" hidden aria-label="machine detail" tabindex="-1">
+  <div class="dw-head">
+    <div>
+      <h2 id="dw-vm"></h2>
+      <div class="sub" id="dw-sub"></div>
+    </div>
+    <button id="dw-close" data-x="close">close</button>
+  </div>
+  <div class="dw-lead" id="dw-lead"></div>
+  <div id="dw-log" role="log" aria-live="polite"></div>
+  <form id="dw-say" class="grp" autocomplete="off">
+    <span class="lbl">steer</span>
+    <div class="btns">
+      <input id="dw-input" placeholder="type into the live session…" aria-label="Message the live session">
+      <button class="primary" type="submit" title="Type this into the running tmux session">send</button>
+      <button class="sky" type="button" data-x="runnew" title="Start a fresh detached run with this prompt, leaving the live session alone">run new</button>
+    </div>
+  </form>
+  <div id="dw-ctl"></div>
+</aside>
+
+<script>
+const $ = s => document.querySelector(s)
+const esc = s => String(s ?? '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]))
+
+// Every tuning number in one place. pollMs is paired with the server's fleet
+// cache TTL: polling faster than the cache only costs battery, and polling much
+// slower makes the "needs you" count lag behind the agents.
+const TUNE = {
+  pollMs: 9000, sessionPollMs: 6000, jobPollMs: 2500,
+  staleMs: 26000,        // no successful fetch for this long: say so, do not lie
+  jobWindowMs: 600000,   // finished jobs older than this leave the strip
+  bootHintMs: 8000,
+  flashMs: 7000,
+  memWarnPct: 70, memBadPct: 88,
+  spendHotUsd: 100,
+  clampChars: 220,       // a transcript turn longer than this clamps to two lines
+}
+// The machine runs a web terminal and a screen share; the row links straight to
+// them. The server may override the ports for its own provisioning; a falsy
+// port means the link is not offered at all.
+const PORTS = { term: 7681, screen: 6080 }
+let port = Object.assign({}, PORTS)
+// Server config the fleet payload does not carry, fetched once from /api/meta.
+// agent is the name the machines actually run (claude, codex, ...) and labels
+// the assistant turns in the drawer.
+const meta = { agent: '' }
+
+// ---------------------------------------------------------------- text hygiene
+// Transcript text is not written for a dashboard. It arrives with image
+// markers, harness tags, base64 and markdown scaffolding. None of that is
+// information about what a machine is doing, so none of it reaches the row. If
+// nothing survives, the row says so - it never prints the junk as a fallback.
+function scrub(s, keepBreaks) {
+  let t = String(s ?? '')
+  t = t.replace(/\[Image:[^\]]*\]/gi, ' ')
+  t = t.replace(/\[(?:Request interrupted|Screenshot|Pasted text)[^\]]*\]/gi, ' ')
+  t = t.replace(/<\/?(?:system-reminder|command-name|command-message|command-args|local-command-stdout|local-command-stderr|thinking)[^>]*>/gi, ' ')
+  // Every harness wrapper tag is hyphenated (task-notification, tool-use-id,
+  // output-file); real markup a person types in a prompt is not. Strip the
+  // hyphenated family wholesale rather than chase each new one.
+  t = t.replace(/<\/?[a-z][a-z0-9]*(?:-[a-z0-9]+)+[^>]*>/gi, ' ')
+  t = t.replace(/\b(?:toolu|msg|req|call)_[A-Za-z0-9]{8,}\b/g, ' ')
+  t = t.replace(/data:[a-z/+.-]+;base64,[A-Za-z0-9+/=]+/gi, ' ')
+  t = t.replace(/```+[a-z]*/gi, ' ')
+  t = t.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/(^|\s)[*_]([^*_\n]+)[*_](?=\s|$)/g, '$1$2')
+  t = t.replace(/^\s*[#>]+\s*/gm, '')
+  t = t.replace(/\u00a0/g, ' ')
+  t = keepBreaks ? t.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+                 : t.replace(/\s+/g, ' ').trim()
+  if (!/[a-z0-9]/i.test(t)) return ''
+  // what is left of a stripped wrapper is usually a bare id. One spaceless
+  // token with a digit in it is not a sentence about what the machine is doing.
+  if (!/\s/.test(t) && /\d/.test(t) && t.length >= 6) return ''
+  return t
+}
+const cut = (s, n) => s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s
+const line = (s, n = 160) => cut(scrub(s), n)
+
+// The "asked:" line is provenance: the thing a person typed. Transcript task
+// text is just as often a truncated harness blob, and what survives scrubbing
+// is then a bare id. An id tells the operator nothing about the machine, so it
+// does not get a line - the row shows nothing instead.
+const idish = w => /^[0-9a-f]{12,}$/i.test(w) || /^[A-Za-z0-9+/=_-]{25,}$/.test(w)
+function humanTask(raw) {
+  let t = scrub(raw)
+  if (!t) return ''
+  t = t.replace(/<[^\s>]*$/, '').replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!t) return ''
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i.test(t)) return ''
+  if (!/\s/.test(t) && t.length > 40) return ''
+  const tok = t.split(' ')
+  const words = tok.filter(w => !idish(w) && /[A-Za-z]/.test(w))
+  if (words.length < tok.length * 0.6) return ''
+  if (words.join('').replace(/[^A-Za-z]/g, '').length < 6) return ''
+  return t
+}
+
+// ---------------------------------------------------------------- work in flight
+// Counters, not a progress theatre. A probe with no summarizer reports none of
+// this; then the line does not exist, rather than reading "0 shells" or worse.
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`
+function workOf(v) {
+  const t = v.tasks && typeof v.tasks === 'object' ? v.tasks : {}
+  const a = v.agents && typeof v.agents === 'object' ? v.agents : {}
+  const done = Number(t.done) || 0, run = Number(t.inProgress) || 0, open = Number(t.open) || 0
+  return {
+    shells: Number(v.shells) || 0,
+    done, run, open, total: done + run + open,
+    arun: Number(a.running) || 0, afin: Number(a.finished) || 0,
+    names: (Array.isArray(a.names) ? a.names : []).map(n => scrub(n)).filter(Boolean),
+    phrase: scrub(v.activity),
+  }
+}
+// The same facts at two densities: the row has one narrow column, the drawer
+// has a paragraph and can spell the counters out.
+function workLine(w, verbose) {
+  const bits = []
+  if (w.shells) bits.push(plural(w.shells, 'shell'))
+  if (verbose && w.total) {
+    bits.push(`${plural(w.total, 'task')}: ` + [
+      w.done ? `${w.done} done` : '', w.run ? `${w.run} running` : '', w.open ? `${w.open} open` : '',
+    ].filter(Boolean).join(', '))
+  } else if (!verbose) {
+    if (w.run) bits.push(`${plural(w.run, 'task')} running`)
+    else if (w.open) bits.push(`${plural(w.open, 'task')} open`)
+    else if (w.total) bits.push(`${w.done}/${w.total} tasks done`)
+  }
+  // one name, then a count. Two full subagent titles wrap the line and the
+  // second one is never the one you are waiting on anyway.
+  if (verbose && w.names.length) bits.push(`agent: ${cut(w.names[0], 58)}${w.names.length > 1 ? ` +${w.names.length - 1}` : ''}`)
+  else if (w.arun) bits.push(verbose ? `${plural(w.arun, 'agent')} running` : plural(w.arun, 'agent'))
+  else if (verbose && w.afin) bits.push(`${plural(w.afin, 'agent')} finished`)
+  return bits.join(' · ') || (verbose ? w.phrase : cut(w.phrase, 46))
+}
+
+const ago = s => !s || s < 0 ? '' : s < 90 ? `${Math.round(s)}s ago` : s < 5400 ? `${Math.round(s/60)}m ago` : `${Math.round(s/3600)}h ago`
+const agoAt = iso => { const t = Date.parse(iso); return isNaN(t) ? '' : ago((Date.now() - t) / 1000) }
+const clock = d => d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})
+
+// ---------------------------------------------------------------- state model
+const LABEL = { working:'working', waiting_for_human:'waiting on you', blocked:'blocked',
+                done:'done', idle:'idle', error:'error', off:'stopped', unknown:'unknown' }
+const KNOWN = new Set(Object.keys(LABEL))
+
+// The server owns state. The client only derives one when the server has not
+// answered yet, and only from things it can actually see - never a guess that
+// something needs you. A false "waiting on you" trains the operator to ignore
+// the attention count, which is the only number on this page that matters.
+function stateOf(v) {
+  const s = String(v.state || '').trim()
+  if (KNOWN.has(s) && s !== 'unknown') return s
+  // power is the provider's own word for the machine being switched off, and
+  // every provider spells it differently. Unreachable AND switched off is a
+  // stopped machine; unreachable while the provider says it is up is a fault.
+  if (!v.reachable) return /stopp|deallocat|shut|off/i.test(v.power || '') ? 'off' : 'error'
+  if ((v.sessions || []).some(x => x.working)) return 'working'
+  if (!(v.sessions || []).length) return 'idle'
+  return 'unknown'
+}
+const ATT = new Set(['waiting_for_human','blocked','error','done'])
+const attentionOf = (v, st) => typeof v.attention === 'boolean' ? v.attention : ATT.has(st)
+const needsOf = v => scrub(v.needs) || (Array.isArray(v.attentionWhy) ? v.attentionWhy.map(x => scrub(x)).filter(Boolean).join(' · ') : '')
+
+// Spend and services are rendered from whatever the probe named, not from a
+// fixed list of vendors and units: adding a second agent or a fifth service is
+// then a change in the probe, not in this file.
+function vendorsOf(c) {
+  const raw = c && c.vendors
+  const one = (name, x) => ({
+    name: scrub(name),
+    usd: typeof x === 'number' ? x : Number(x && x.usd) || 0,
+    tokens: Number(x && x.tokens) || 0,
+  })
+  // agent/af-cost.py, the only writer of cost.json this repo ships, has no
+  // `vendors` key: it emits flat pairs (claudeUsd/claudeTokens, codexUsd/
+  // codexTokens) plus totalUsd. Without this fallback the tooltip below loses
+  // the split it exists for and says only "since midnight <tz>".
+  // totalUsd is the sum, not a vendor, so it is skipped; a pair that spent
+  // nothing and moved no tokens is a vendor this machine did not run today.
+  const flat = () => Object.keys(c || {}).map(k => /^(.+)Usd$/.exec(k))
+    .filter(m => m && m[1] !== 'total')
+    .map(m => one(m[1], { usd: c[m[0]], tokens: c[m[1] + 'Tokens'] }))
+    .filter(x => x.usd || x.tokens)
+  const list = Array.isArray(raw) ? raw.map(x => one(x && x.name, x))
+             : raw && typeof raw === 'object' ? Object.keys(raw).map(k => one(k, raw[k]))
+             : flat()
+  return list.filter(x => x.name)
+}
+const usdOf = c => Number(c && c.totalUsd) || vendorsOf(c).reduce((n, x) => n + x.usd, 0)
+const money = n => n < 1 ? '$' + n.toFixed(2) : '$' + Math.round(n)
+// The server names each check `key` (AF_DASH_SERVICES entries are "key|port:n");
+// `label` is only what a hand-written probe might send instead. Reading label
+// alone dropped every entry the filter, so the SERVICES column was blank on
+// every machine in the fleet. Read both.
+// ok is tri-state: null means "not configured / did not report". Painting a
+// null through !! puts a red down-dot on a service nobody enabled, so an
+// unreported check is left out rather than reported as a fault.
+function servicesOf(v) {
+  const s = v.services
+  const rows = Array.isArray(s) ? s.map(x => [x && (x.label ?? x.key), x && x.ok])
+             : s && typeof s === 'object' ? Object.keys(s).map(k => [k, s[k]])
+             : []
+  return rows.map(([name, ok]) => ({ label: scrub(name), ok: !!ok, reported: ok !== null && ok !== undefined }))
+             .filter(x => x.label && x.reported)
+}
+
+// ---------------------------------------------------------------- transport
+let flashTimer = 0
+function flash(msg) {
+  const el = $('#flash'); el.textContent = msg; el.dataset.on = '1'
+  clearTimeout(flashTimer); flashTimer = setTimeout(() => delete el.dataset.on, TUNE.flashMs)
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts)
+  // An expired cookie must land on the login page. Without this the data simply
+  // freezes and the page looks like a fleet where nothing ever happens.
+  if (r.status === 401) { location.reload(); throw new Error('auth') }
+  return r
+}
+async function post(host, action, prompt) {
+  try {
+    const r = await api('/api/action', { method:'POST', headers:{'content-type':'application/json'},
+      // the machine name goes under both keys: the server validates one of them
+      // against its inventory and ignores the other, and a rename on that side
+      // must not silently turn every button into a 400.
+      body: JSON.stringify({ host, vm: host, action, prompt }) })
+    if (!r.ok) { const e = await r.json().catch(() => ({})); flash(`${host} ${action}: ${e.error || r.status}`); return false }
+    pollJobs(); return true
+  } catch { flash(`${host} ${action}: the dashboard could not reach the server`); return false }
+}
+
+// Destructive verbs confirm with the consequence spelled out, not "are you sure?"
+const CONFIRM = {
+  stop: h => `Stop ${h}?\n\nRunning sessions and any in-flight work are lost. The disk is kept, so it can be started again.`,
+  clear: h => `Clear the session on ${h}?\n\nThe conversation context is dropped. The machine and its files are untouched.`,
+  provision: h => `Reprovision ${h}?\n\nReinstalls the toolchain from scratch and interrupts anything running on it. This is slow.`,
+}
+function act(host, action, prompt) {
+  if (CONFIRM[action] && !confirm(CONFIRM[action](host))) return false
+  return post(host, action, prompt)
+}
+
+// ---------------------------------------------------------------- rows
+const ROWS = $('#rows')
+const CELLS = ['vm','state','act','mem','cost','repo','svc','go']
+const CHEV = '<svg class="chev" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+const cache = new Map()   // host -> { tr, html:{cell:string}, state, els }
+
+function stateCell(v, st, changed) {
+  // One coloured word, and nothing else. The elapsed time, the tool and the
+  // shells/tasks/agents breakdown all still exist - in the hover title and in
+  // the drawer, where there is room to read them.
+  const w = workOf(v)
+  const detail = [ago(v.idleSec), v.tool && st === 'working' ? scrub(v.tool) : '',
+                  v.reachable ? workLine(w, true) : ''].filter(Boolean).join(' · ')
+  return `<span class="st st-${st}${changed ? ' changed' : ''}" title="${esc(detail)}"><i class="mk"></i>${LABEL[st] || esc(st)}</span>`
+}
+
+function cellsFor(v, st) {
+  // The column shows the name you type at the CLI and nothing else. Region,
+  // size and uptime were wrapping it onto three lines for no benefit; they live
+  // in the hover title and the drawer instead.
+  const meta = v.reachable
+    ? [v.region, v.size, v.uptimeH ? `up ${v.uptimeH}h` : ''].filter(Boolean).join(' · ')
+    : scrub(v.power) || 'unreachable'
+
+  const out = {}
+  out.vm = `<span class="vmname" title="${esc(meta)}">${esc(v.host)}</span>` +
+           (v.reachable ? '' : `<small>${esc(scrub(v.power) || 'unreachable')}</small>`)
+
+  if (!v.reachable) {
+    // A machine we could not reach reports nothing, so it prints nothing. Zeros
+    // here would read as a healthy-but-empty machine and would light the memory
+    // alarm on a box that is merely off.
+    const off = st === 'off'
+    out.act = `<span class="sum none">${off ? 'Stopped. Nothing is running.' : 'No ssh. It may be booting, wedged, or off the network.'}</span>`
+    out.mem = out.cost = out.repo = out.svc = '<span class="quiet">-</span>'
+  } else {
+    const sum = line(v.summary)
+    const asked = humanTask(v.task)
+    const task = cut(asked, 120)
+    const needs = line(needsOf(v), 120)
+    out.act =
+      (sum ? `<span class="sum" title="${esc(scrub(v.summary))}">${esc(sum)}</span>`
+           : `<span class="sum none">no summary yet</span>`) +
+      (needs ? `<span class="needs" title="${esc(needs)}">${esc(needs)}</span>` : '') +
+      (task ? `<span class="task" title="${esc(asked)}">${esc(task)}</span>` : '')
+
+    if (v.memPct == null || v.freeGb == null) out.mem = '<span class="quiet">-</span>'
+    else {
+      const mcls = v.memPct >= TUNE.memBadPct ? 'bad' : v.memPct >= TUNE.memWarnPct ? 'warn' : ''
+      out.mem = `<div class="mem"><span class="v mono">${esc(v.freeGb)}<span style="color:var(--muted);opacity:.7">/${esc(v.totalGb)}G free</span></span>
+        <span class="bar ${mcls}"><i style="transform:scaleX(${((v.memPct || 0) / 100).toFixed(3)})"></i></span></div>`
+    }
+
+    // spelled out, because git's "dirty" means nothing outside git: files
+    // changed on that machine and not yet committed exist only there
+    const repo = [v.uncommitted ? `${v.uncommitted} uncommitted` : '', v.ahead ? `${v.ahead} to push` : '', v.behind ? `${v.behind} to pull` : ''].filter(Boolean)
+    // Today's model spend on THIS machine, local day. One number; the per-vendor
+    // split and token counts live in the tooltip - the column exists to answer
+    // "which box is burning money", not to be read to two decimals.
+    const c = v.cost
+    const vs = vendorsOf(c)
+    if (!c || (!vs.length && !c.totalUsd)) out.cost = '<span class="quiet">-</span>'
+    else {
+      const t = usdOf(c)
+      const detail = vs.map(x => `${x.name} $${x.usd.toFixed(2)}` + (x.tokens ? ` (${(x.tokens/1e6).toFixed(1)}M tokens)` : ''))
+        .concat([`since midnight ${scrub(c.tz || '')}`.trim()]).join('\n')
+      out.cost = `<span class="cost${t >= TUNE.spendHotUsd ? ' hot' : ''}" title="${esc(detail)}">${money(t)}</span>`
+    }
+    out.repo = repo.length
+      ? `<span class="repo dirty mono" title="changed files that exist only on this machine until they are committed and pushed">${esc(repo.join(' · '))}</span>`
+      : '<span class="quiet">in sync</span>'
+
+    const svcs = servicesOf(v)
+    out.svc = svcs.length
+      ? `<div class="dots" title="${esc(svcs.map(x => `${x.label}: ${x.ok ? 'up' : 'down'}`).join('\n'))}">` +
+        svcs.map(x => `<span class="dot ${x.ok ? 'on' : 'off'}" title="${esc(x.label)}"></span>`).join('') + '</div>'
+      : '<span class="quiet">-</span>'
+  }
+
+  // These links resolve in YOUR browser, not on the server, so they only work
+  // from a network that can reach the machine directly.
+  const at = esc(v.addr || v.host)
+  out.go = `<div class="go">
+    ${v.reachable && port.term ? `<a class="link" href="http://${at}:${esc(port.term)}" target="_blank" rel="noopener">term</a>` : ''}
+    ${v.reachable && port.screen ? `<a class="link" href="http://${at}:${esc(port.screen)}/vnc.html" target="_blank" rel="noopener">screen</a>` : ''}
+    ${st === 'off' ? `<button data-x="start" data-vm="${esc(v.host)}">start</button>` : ''}${CHEV}</div>`
+  return out
+}
+
+const EMPTY = `<tr><td colspan="${CELLS.length}" class="empty">
+  <b>No machines yet.</b>
+  List the machines you already have in <code>AF_HOSTS</code>, or have agentfleet make one:<br>
+  <code>agentfleet up w1</code> &nbsp; then &nbsp; <code>agentfleet sync w1</code><br>
+  This page fills in on the next poll.
+</td></tr>`
+
+let latest = null, lastOkAt = 0
+function paint(d) {
+  if (!d) return
+  latest = d
+  if (d.ports) port = Object.assign({}, PORTS, d.ports)
+  // Drop any placeholder still sitting in the table - the boot row AND the
+  // "No machines yet" row, neither of which carries a data-vm. Keying this off
+  // the boot cell's id alone left the empty-state row pinned above the first
+  // real machine for the rest of the session (EMPTY has no #boot), and its
+  // undefined data-vm also made the reorder test below fail on every poll,
+  // re-appending every row and dropping focus each time.
+  const first = ROWS.firstElementChild
+  if (first && !first.dataset.vm) ROWS.textContent = ''
+
+  const up = d.hosts.filter(v => v.reachable)
+  const decorated = d.hosts.map(v => { const st = stateOf(v); return { v, st, att: attentionOf(v, st) } })
+  // Order by what you should look at, then by name so a machine never jumps
+  // around between polls: needs-you, then working, then the quiet ones.
+  // A pure severity sort makes rows swap positions under the cursor mid-click.
+  const rank = o => o.att ? 0 : (o.st === 'working' ? 1 : 2)
+  const order = [...decorated].sort((a, b) =>
+    rank(a) - rank(b) || a.v.host.localeCompare(b.v.host, undefined, { numeric: true }))
+  const attN = order.filter(o => o.att).length
+
+  const starved = up.filter(v => v.memPct >= TUNE.memBadPct)
+  const working = decorated.filter(o => o.st === 'working').length
+  const freeG = up.reduce((n, v) => n + (v.freeGb || 0), 0)
+  const stale = Date.now() - lastOkAt > TUNE.staleMs
+
+  $('#count').textContent = d.hosts.length ? `${up.length}/${d.hosts.length}` : ''
+  const spend = (() => {   // fleet spend today, same per-vendor split as the column
+    const per = new Map()
+    let total = 0
+    for (const v of d.hosts) {
+      if (!v.cost) continue
+      total += usdOf(v.cost)
+      for (const x of vendorsOf(v.cost)) per.set(x.name, (per.get(x.name) || 0) + x.usd)
+    }
+    if (!per.size && !total) return ''
+    const tip = [...per].map(([n, u]) => `${n} $${u.toFixed(2)}`)
+      .concat(['agent model spend on the machines since midnight; the cloud bill is not in here']).join('\n')
+    return `<span title="${esc(tip)}"><b>${money(total)}</b> today</span>`
+  })()
+  $('#vitals').innerHTML = [
+    attN ? `<span class="alarm"><b style="color:inherit">${attN}</b> need${attN === 1 ? 's' : ''} you</span>` : '',
+    working ? `<span><b>${working}</b> working</span>` : '',
+    up.length ? `<span><b>${Math.round(freeG)}G</b> free</span>` : '',
+    spend,
+    starved.length ? `<span class="alarm">${starved.length} starved</span>` : '',
+    `<button id="stamp" data-x="reprobe" class="${stale ? 'stale' : ''}" title="Click to re-probe every machine now">${stale ? 'stale · ' : ''}updated ${clock(new Date(d.at))}</button>`,
+  ].filter(Boolean).join('')
+
+  if (!order.length) { cache.clear(); ROWS.innerHTML = EMPTY; return }
+
+  for (const { v, st, att } of order) {
+    let ent = cache.get(v.host)
+    if (!ent) {
+      const tr = document.createElement('tr')
+      tr.dataset.vm = v.host; tr.tabIndex = 0; tr.setAttribute('role', 'button')
+      tr.innerHTML = CELLS.map(c => `<td class="c-${c}"></td>`).join('')
+      ent = { tr, html: {}, state: null, els: {} }
+      CELLS.forEach(c => ent.els[c] = tr.querySelector('.c-' + c))
+      cache.set(v.host, ent)
+    }
+    const changed = ent.state !== null && ent.state !== st
+    const next = cellsFor(v, st)
+    next.state = stateCell(v, st, changed)
+    // cell-by-cell diff: rewriting the whole row every poll would drop keyboard
+    // focus, close an open tooltip and clear a text selection mid-read.
+    for (const c of CELLS) if (ent.html[c] !== next[c]) { ent.els[c].innerHTML = next[c]; ent.html[c] = next[c] }
+    ent.state = st
+    ent.tr.classList.toggle('att', att)
+    ent.tr.classList.toggle('down', !v.reachable)
+    ent.tr.classList.toggle('sel', dw.host === v.host)
+    ent.tr.classList.remove('att-last')
+  }
+  if (attN && attN < order.length) cache.get(order[attN - 1].v.host).tr.classList.add('att-last')
+
+  // reorder only when it actually differs - appendChild would drop focus
+  const want = order.map(o => o.v.host)
+  const have = [...ROWS.children].map(tr => tr.dataset.vm)
+  if (want.join() !== have.join()) for (const h of want) ROWS.appendChild(cache.get(h).tr)
+
+  if (dw.host) paintDrawer()
+}
+
+async function refresh(force) {
+  try {
+    const r = await api('/api/fleet' + (force ? '?force=1' : ''))
+    const d = await r.json()
+    // One list, one name for the machine, whatever the server called them.
+    d.hosts = (Array.isArray(d.hosts) ? d.hosts : Array.isArray(d.vms) ? d.vms : [])
+      .map(v => (v.host ? v : Object.assign({}, v, { host: v.vm })))
+      .filter(v => v.host)
+    lastOkAt = Date.now()
+    paint(d)
+  } catch (e) {
+    if (String(e.message) === 'auth') return
+    // Repaint the last good data and let the stamp go stale, so you can tell
+    // "nothing is happening" apart from "I cannot see".
+    if (latest) paint(latest)
+    else { const b = $('#boot'); if (b) b.textContent = 'Cannot reach the dashboard server. Retrying.' }
+  }
+}
+
+// Ports, the agent's name and the poll cadence are configuration, and
+// configuration lives on the server: /api/fleet never carries them, /api/meta
+// does. Without this fetch the row links stay nailed to the built-in 7681/6080
+// no matter what AF_TERM_PORT/AF_NOVNC_PORT say (the operator gets a dead tab
+// and blames ttyd), emptying a port does not remove its link the way the docs
+// promise, and every assistant turn in the drawer is labelled "agent" instead
+// of the agent the fleet runs. Failure here is not fatal: the built-in defaults
+// are the documented defaults, so the table still works.
+async function loadMeta() {
+  try {
+    const r = await api('/api/meta'); if (!r.ok) return
+    const m = await r.json()
+    // Empty means "do not offer this link", and Number('') is 0, which the row
+    // renderer already reads as no link. Anything unparsable lands on 0 too:
+    // no link beats a link to a port nothing is listening on.
+    if ('termPort' in m) port.term = Number(m.termPort) || 0
+    if ('screenPort' in m) port.screen = Number(m.screenPort) || 0
+    meta.agent = String(m.agent || '')
+    // Poll in step with the server's cache instead of guessing at it.
+    const t = m.tuning || {}
+    for (const k of ['pollMs', 'sessionPollMs', 'staleMs']) if (Number(t[k]) > 0) TUNE[k] = Number(t[k])
+    arm()
+    if (latest) paint(latest)   // links already on screen were drawn with the old ports
+  } catch { /* keep the defaults */ }
+}
+
+// ---------------------------------------------------------------- drawer
+const dw = { host: null, entries: null, err: '', returnTo: null, busy: false }
+
+function openDrawer(host, fromEl) {
+  const first = dw.host !== host
+  if (first) { dw.entries = null; dw.err = ''; $('#dw-log').innerHTML = '<p class="quiet">loading the session…</p>' }
+  dw.host = host
+  if (fromEl) dw.returnTo = fromEl
+  $('#dw').hidden = false
+  requestAnimationFrame(() => document.body.classList.add('dw'))
+  paintDrawer(); loadSession(true)
+  if (first) $('#dw').focus({ preventScroll: true })
+  if (latest) paint(latest)
+}
+function closeDrawer() {
+  if (!dw.host) return
+  const back = dw.returnTo
+  dw.host = null; dw.returnTo = null
+  document.body.classList.remove('dw')
+  setTimeout(() => { if (!dw.host) $('#dw').hidden = true }, 260)
+  if (latest) paint(latest)
+  if (back && document.contains(back)) back.focus({ preventScroll: true })
+}
+
+// Three groups below the composer, in escalating consequence. The caption is
+// the reason they are apart: "session" verbs stop the agent mid-turn, "machine"
+// verbs do not, and "danger" throws the running work away.
+function ctlFor(v, st) {
+  const b = (x, label, cls, title) => `<button data-x="${x}"${cls ? ` class="${cls}"` : ''} title="${esc(title)}">${label}</button>`
+  const grp = (label, cls, btns) => {
+    const inner = btns.filter(Boolean).join('')
+    return inner ? `<div class="grp ${cls}"><span class="lbl">${label}</span><div class="btns">${inner}</div></div>` : ''
+  }
+  const on = !!v.reachable
+  return [
+    grp('session', '', [
+      on ? b('interrupt', 'interrupt', 'caution', 'Escape the turn in flight. The agent stops mid-thought and waits.') : '',
+      on ? b('clear', 'clear', 'caution', 'Drop the conversation context in the live session. The machine and its files are untouched.') : '',
+    ]),
+    grp('machine', '', [
+      on ? b('sync', 'sync', '', 'Push your agent config and repo state to this machine') : '',
+      on ? b('browser', 'browser', '', 'Restart the headless browser on this machine') : '',
+      on ? b('provision', 'provision', '', 'Full reprovision. Slow, and it interrupts anything running.') : '',
+      !on || st === 'off' ? b('start', 'start', '', 'Boot this machine') : '',
+    ]),
+    grp('danger', 'kill', [
+      on ? b('stop', 'stop', 'danger', 'Stop this machine. Running sessions and in-flight work are lost.') : '',
+    ]),
+  ].filter(Boolean).join('')
+}
+
+function paintDrawer() {
+  const rec = latest && latest.hosts.find(x => x.host === dw.host)
+  if (!rec) return
+  const st = stateOf(rec)
+  $('#dw-vm').textContent = rec.host
+  // What the machine IS - never what the harness called this session. A session
+  // uuid and a process count are not facts about the box you are looking at.
+  const facts = rec.reachable
+    ? [`<b>${LABEL[st] || st}</b>`, rec.region, rec.size,
+       rec.uptimeH ? `up ${Math.round(rec.uptimeH)}h` : '',
+       rec.freeGb == null ? '' : `${rec.freeGb}/${rec.totalGb}G free`,
+       rec.load ? `load ${esc(rec.load)}` : '',
+       rec.swapUsedMb ? `swap ${rec.swapUsedMb}M` : '']
+    : [`<b>${LABEL[st] || st}</b>`, esc(scrub(rec.power) || 'no ssh')]
+  $('#dw-sub').innerHTML = facts.filter(Boolean).join(' · ')
+
+  const sum = scrub(rec.summary), needs = needsOf(rec), task = humanTask(rec.task)
+  const work = rec.reachable ? workLine(workOf(rec), true) : ''
+  $('#dw-lead').innerHTML =
+    (sum ? `<span class="sum">${esc(cut(sum, 420))}</span>` : `<span class="sum none">no summary yet</span>`) +
+    (needs ? `<span class="needs">${esc(cut(needs, 300))}</span>` : '') +
+    (work ? `<span class="work">${esc(cut(work, 260))}</span>` : '') +
+    (task ? `<span class="task">${esc(cut(task, 300))}</span>` : '')
+  $('#dw-ctl').innerHTML = ctlFor(rec, st)
+  $('#dw-input').disabled = !rec.reachable
+  ;[...$('#dw-say').querySelectorAll('button')].forEach(b => b.disabled = !rec.reachable)
+}
+
+function paintSession(jump) {
+  const el = $('#dw-log')
+  // A terminal runs down the page: oldest at the top, newest at the bottom, and
+  // opening it puts you at the newest line. The poll re-pins to the bottom ONLY
+  // if you were already there - being yanked back down mid-scroll while reading
+  // an hour-old turn is the whole reason a live log gets closed.
+  const wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90
+  const stick = jump || wasAtBottom
+  const keep = el.scrollTop
+  if (dw.err) { el.innerHTML = `<p class="quiet">${esc(dw.err)}</p>`; return }
+  const es = dw.entries
+  if (!es) return
+  if (!es.length) { el.innerHTML = '<p class="quiet">No transcript on this machine yet.</p>'; return }
+  // Readable conversation, not a transcript dump. Two more rules:
+  //  - every turn clamped to two lines; click to expand the one you care about
+  //  - consecutive tool calls collapse to one dim line ("4 tools: Read, Bash"),
+  //    or a single turn with thirty tool calls fills the whole drawer
+  const rows = []
+  for (const e of es) {
+    const role = e.role === 'user' ? 'user' : e.role === 'tool' ? 'tool' : 'assistant'
+    if (role === 'tool') {
+      const name = (e.tool || 'tool').replace(/^mcp__/, '').replace(/__/g, ' ')
+      const prev = rows[rows.length - 1]
+      if (prev && prev.role === 'tool') { prev.tools.push(name); prev.at = e.at || prev.at; continue }
+      rows.push({ role: 'tool', tools: [name], at: e.at })
+      continue
+    }
+    const body = scrub(e.text, true)
+    if (!body) continue
+    rows.push({ role, text: body, at: e.at })
+  }
+  const them = agentLabel()
+  el.innerHTML = rows.map(r => {
+    const when = r.at ? `<time title="${esc(r.at)}">${esc(agoAt(r.at))}</time>` : ''
+    if (r.role === 'tool') {
+      const uniq = [...new Set(r.tools)]
+      const label = r.tools.length > 1
+        ? `${r.tools.length} tools · ${uniq.slice(0, 3).join(', ')}${uniq.length > 3 ? '…' : ''}`
+        : uniq[0]
+      return `<div class="tx tool"><div class="row"><span>${esc(label)}</span>${when}</div></div>`
+    }
+    const full = cut(r.text, 4000)
+    const long = full.length > TUNE.clampChars
+    return `<div class="tx ${r.role}${long ? ' clamped' : ''}"${long ? ' data-x="expand"' : ''}>
+      <div class="who"><span>${r.role === 'user' ? 'you' : esc(them)}</span>${when}</div>
+      <p>${esc(full)}</p>${long ? '<span class="more">more</span>' : ''}</div>`
+  }).join('')
+  // innerHTML resets scrollTop to 0, so a reader who is scrolled up gets the
+  // exact offset back rather than being thrown to the top of an hour of log.
+  el.scrollTop = stick ? el.scrollHeight : keep
+}
+
+// Whose turns these are is the probe's to say: the fleet may not be running the
+// agent this file was first written against.
+function agentLabel() {
+  const rec = latest && latest.hosts.find(x => x.host === dw.host)
+  // meta.agent is the configured AF_AGENT from /api/meta; neither the row nor
+  // the fleet payload carries an agent name today, so without it every turn
+  // reads "agent".
+  return scrub(rec && rec.agent) || scrub(latest && latest.agent) || scrub(meta.agent) || 'agent'
+}
+
+async function loadSession(jump) {
+  const host = dw.host; if (!host) return
+  try {
+    const r = await api('/api/session/' + encodeURIComponent(host))
+    if (!r.ok) throw new Error(r.status === 404 ? 'This server build has no transcript endpoint yet.' : `Transcript unavailable (${r.status}).`)
+    const d = await r.json()
+    if (dw.host !== host) return
+    dw.err = d.ok === false ? (scrub(d.error) || 'No transcript could be read on this machine.') : ''
+    dw.entries = Array.isArray(d.entries) ? d.entries : []
+    paintSession(jump)
+    // the drawer may still have been mid-transition when the rows landed, so
+    // the height it measured was wrong; settle on the newest line once more
+    if (jump) requestAnimationFrame(() => { const el = $('#dw-log'); el.scrollTop = el.scrollHeight })
+  } catch (e) {
+    if (dw.host !== host || String(e.message) === 'auth') return
+    dw.err = e.message || 'Transcript unavailable.'
+    paintSession(jump)
+  }
+}
+
+// ---------------------------------------------------------------- events
+ROWS.addEventListener('click', e => {
+  if (e.target.closest('a,button,input')) return
+  const tr = e.target.closest('tr[data-vm]'); if (tr) openDrawer(tr.dataset.vm, tr)
+})
+ROWS.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ') return
+  const tr = e.target.closest('tr[data-vm]')
+  if (tr && e.target === tr) { e.preventDefault(); openDrawer(tr.dataset.vm, tr) }
+})
+// expand a clamped turn in place (the div carries data-x, not a button)
+$('#dw-log').addEventListener('click', e => {
+  const tx = e.target.closest('.tx.clamped'); if (!tx) return
+  tx.classList.toggle('open')
+})
+document.addEventListener('click', e => {
+  const b = e.target.closest('button[data-x]'); if (!b) return
+  const x = b.dataset.x
+  if (x === 'close') return closeDrawer()
+  if (x === 'reprobe') return refresh(true)
+  if (x === 'runnew') return send('run')
+  const host = b.dataset.vm || dw.host; if (!host) return
+  e.stopPropagation()
+  act(host, x)
+})
+$('#scrim').addEventListener('click', closeDrawer)
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && dw.host) closeDrawer() })
+
+async function send(action) {
+  const input = $('#dw-input'), text = input.value.trim()
+  if (!dw.host || !text || dw.busy) return
+  dw.busy = true
+  const ok = await act(dw.host, action, text)
+  dw.busy = false
+  if (ok) { input.value = ''; setTimeout(() => loadSession(true), 1200) }
+}
+$('#dw-say').addEventListener('submit', e => { e.preventDefault(); send('say') })
+
+// ---------------------------------------------------------------- jobs
+// Only what is live or just finished. The server keeps a backlog; a permanent
+// block of week-old jobs pinned to the bottom of a phone is not a teletype.
+async function pollJobs() {
+  try {
+    const r = await api('/api/jobs'); if (!r.ok) return
+    const all = (await r.json()).jobs || []
+    const jobs = all.filter(j => j.state === 'running' || (Date.now() - (j.started || 0)) < TUNE.jobWindowMs).slice(0, 6)
+    $('#log').innerHTML = jobs.map(j => `<div class="j"><b>${esc(j.host || j.vm)}</b><span>${esc(j.action)}</span>
+      <span class="st-${esc(j.state)}">${esc(j.state)}${j.ms ? ` ${(j.ms/1000).toFixed(0)}s` : ''}</span></div>
+      ${j.out && j.state !== 'running' ? `<pre>${esc(cut(String(j.out).split('\n').slice(-6).join('\n'), 900))}</pre>` : ''}`).join('')
+    if (jobs.some(j => j.state === 'running')) setTimeout(pollJobs, TUNE.jobPollMs)
+    else refresh(true)
+  } catch {}
+}
+
+// ---------------------------------------------------------------- loop
+// The timers are re-armed once /api/meta answers with the server's own cadence.
+// They are started here first, not after that fetch, so a slow or missing
+// /api/meta can never leave the page frozen on its first paint.
+let timers = []
+function arm() {
+  for (const t of timers) clearInterval(t)
+  // phones background tabs aggressively; do not poll into the void, refresh on return
+  timers = [
+    setInterval(() => { if (!document.hidden) refresh() }, TUNE.pollMs),
+    setInterval(() => { if (!document.hidden && dw.host) loadSession(false) }, TUNE.sessionPollMs),
+  ]
+}
+refresh(); pollJobs(); arm(); loadMeta()
+setTimeout(() => { const b = $('#boot'); if (b) b.textContent = 'Still probing. One wedged machine can hold this up until its ssh timeout expires.' }, TUNE.bootHintMs)
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { refresh(true); if (dw.host) loadSession(false) } })
+</script>
+</body>
+</html>

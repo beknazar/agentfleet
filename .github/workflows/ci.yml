@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1090/SC1091: the config file is sourced at runtime, not present here.
+          # SC2034: lib/common.sh defines the AF_* defaults that the sourced
+          # subcommand files consume, which shellcheck cannot follow across
+          # a dynamic `. "$AF_DIR/lib/$x.sh"`.
+          shellcheck -x -e SC1090,SC1091,SC2034 \
+            agentfleet lib/*.sh providers/*.sh agent/*.sh install.sh
+
+      - name: bash syntax
+        run: for f in agentfleet lib/*.sh providers/*.sh agent/*.sh install.sh; do bash -n "$f"; done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: node syntax
+        run: for f in dashboard/*.mjs; do node --check "$f"; done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: python compile
+        run: python -m compileall -q agent/*.py
+
+      - name: no personal data
+        # A public repo must not carry the author's home path, hostnames or org.
+        # Anything real belongs in the user's own config file, never in the tree.
+        run: |
+          if grep -rnIE '/Users/abdik|speko|abdik@|sp-w[0-9]' \
+               --exclude-dir=.git --exclude=ci.yml . ; then
+            echo "::error::personal data leaked into the repo (see matches above)"
+            exit 1
+          fi

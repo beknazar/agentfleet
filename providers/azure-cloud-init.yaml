@@ -1,0 +1,44 @@
+#cloud-config
+# Rendered by providers/azure.sh at create time: the braced placeholders below
+# are substituted there, including your own ssh public key. Edit this file,
+# never the rendered copy under ~/.cache/agentfleet.
+#
+# PATH-MIRRORED HOME. The login user's home is set to your laptop's home path
+# (AF_HOME), not /home/<user>. That is what lets every absolute path inside
+# synced agent config, hooks, skills and notes resolve identically on both
+# machines with no rewriting. It also settles one rule for everything installed
+# later: no strictly confined snaps. Their AppArmor profiles cannot read a home
+# outside /home, so tools must come from apt or a vendor installer instead.
+users:
+  - default
+  - name: {{AF_USER}}
+    shell: /usr/bin/zsh
+    homedir: {{AF_HOME}}
+    groups: sudo
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - {{AF_PUBKEY}}
+
+package_update: true
+
+# Keep jq and zsh in this list. Provisioning treats "the login user exists and
+# these are installed" as the readiness signal, deliberately in preference to
+# cloud-init's own status: one wedged apt download leaves cloud-init reporting
+# "running" forever on a machine that is otherwise perfectly usable.
+packages:
+  - jq
+  - tmux
+  - zsh
+  - git
+  - curl
+  - unzip
+  - rsync
+  - build-essential
+  - python3-pip
+  - python3-venv
+
+runcmd:
+  # Tailscale, unless AF_TAILNET=off. Joining the tailnet happens later, during
+  # provisioning, with your auth key - none of it is baked into this image.
+  - ['sh', '-c', 'if [ {{AF_TAILSCALE}} = 1 ]; then curl -fsSL https://tailscale.com/install.sh | sh; fi']
+  - ['sh', '-c', 'timedatectl set-timezone {{AF_TIMEZONE}}']

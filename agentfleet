@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# agentfleet - run a fleet of coding agents on remote machines, from one screen.
+#
+# https://github.com/beknazar/agentfleet
+set -euo pipefail
+
+# Resolve through symlinks: install.sh puts a link in /usr/local/bin, but the
+# lib/, providers/ and agent/ directories live next to the real file.
+af_self="${BASH_SOURCE[0]}"
+while [ -L "$af_self" ]; do
+  af_link="$(readlink "$af_self")"
+  case "$af_link" in
+    /*) af_self="$af_link" ;;
+    *)  af_self="$(dirname "$af_self")/$af_link" ;;
+  esac
+done
+AF_DIR="$(cd "$(dirname "$af_self")" && pwd)"
+export AF_DIR
+
+# shellcheck source=lib/common.sh
+. "$AF_DIR/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+agentfleet - run a fleet of coding agents on remote machines, from one screen.
+
+  setup
+    init                      write a config, make an ssh key, generate ssh aliases
+    up <host> [size]          create a machine and provision it        (cloud providers)
+    provision <host|all>      install the toolchain; safe to re-run on a half-built box
+    sync <host|all> [--fast] [--force]
+                              push your agent config, dotfiles and repo to the machines
+    login <host> <cmd...>     authenticate the agent CLI on the machine: runs the login
+                              command there, opens the OAuth tab in YOUR browser
+    sshconfig                 regenerate ~/.ssh/<name>.conf and the shell aliases
+
+  every day
+    ls [host...]              one screen: what each agent is doing, and which need you
+    dash                      the same thing as a web page you can open on your phone
+    say [-s session] <host> <text>
+                              type into the live agent session
+    run [-s session] [--cwd dir] <host> <prompt>
+                              start a detached agent job in its own tmux session
+    attach <host> [session]   drop into the machine's tmux
+    ssh <host> [cmd...]       run a command there
+
+  machines
+    start <host...|all>       resume machines stopped with `down`       (cloud providers)
+    down <host> [--delete]    stop billing (keeps the disk), or destroy it
+    unlock [host...]          re-point the cloud firewall at your current IP after a network change
+    secrets push [host|all]   distribute the credential files listed in your config
+
+  optional
+    browser <host|all>        headless Chrome on the machine, watchable over noVNC
+    browser mac-chrome start|up|down|status [host|all]
+                              tunnel YOUR laptop's browser to a machine (AF_MAC_CHROME=1)
+    drop [-c] [file] [host|all]
+                              copy a file (or the clipboard image) to the machines' inbox
+
+  version                     print the version
+  agentfleet <command> --help   for details on any of these
+
+Config: ~/.config/agentfleet/config  (or ./agentfleet.conf)
+Docs:   README.md, docs/configuration.md, docs/security.md, docs/providers.md
+EOF
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  help|--help|-h) usage; exit 0 ;;
+  version|--version|-V) printf 'agentfleet %s\n' "$AF_VERSION"; exit 0 ;;
+esac
+
+# `init` is the one command that runs without a config, since writing one is
+# its whole job.
+if [ "$cmd" = init ]; then
+  AF_CONFIG_OPTIONAL=1 af_load_config
+  # shellcheck source=lib/init.sh
+  . "$AF_DIR/lib/init.sh"
+  cmd_init "$@"
+  exit $?
+fi
+
+af_load_config
+af_provider_load
+
+case "$cmd" in
+  up|provision)
+    # shellcheck source=lib/provision.sh
+    . "$AF_DIR/lib/provision.sh"; "cmd_$cmd" "$@" ;;
+  sync|secrets)
+    # shellcheck source=lib/sync.sh
+    . "$AF_DIR/lib/sync.sh"; "cmd_$cmd" "$@" ;;
+  ls|dash|say|run|attach|ssh|start|down|unlock)
+    # shellcheck source=lib/control.sh
+    . "$AF_DIR/lib/control.sh"; "cmd_$cmd" "$@" ;;
+  browser|drop|login)
+    # shellcheck source=lib/browser.sh
+    . "$AF_DIR/lib/browser.sh"; "cmd_$cmd" "$@" ;;
+  sshconfig)
+    # shellcheck source=lib/init.sh
+    . "$AF_DIR/lib/init.sh"; cmd_sshconfig "$@" ;;
+  *)
+    printf 'agentfleet: unknown command: %s\n\n' "$cmd" >&2
+    usage >&2
+    exit 1 ;;
+esac
