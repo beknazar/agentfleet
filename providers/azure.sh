@@ -168,7 +168,9 @@ provider_create() {
         --assign-identity \
         --custom-data "$ci" \
         --query publicIpAddress -o tsv)" || af_die "azure: creating $host failed"
-  [ -n "$ip" ] && [ "$ip" != None ] || af_die "azure: $host was created without a public IP address"
+  if [ -z "$ip" ] || [ "$ip" = None ]; then
+    af_die "azure: $host was created without a public IP address"
+  fi
 
   if [ -n "$myip" ]; then
     local cidr; cidr="$(az_cidr "$myip")"

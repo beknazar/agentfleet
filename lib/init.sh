@@ -124,6 +124,8 @@ af_sshconfig_taken() {
 # while staying perfectly healthy. The tailnet address does not care. The
 # <host>-direct alias keeps the provider address available for the opposite
 # case: when the tailnet itself is what broke.
+# shellcheck disable=SC2120  # only ever takes an optional -h; the internal
+# callers in this file and lib/provision.sh pass nothing on purpose.
 cmd_sshconfig() {
   case "${1:-}" in
     -h|--help) printf 'usage: agentfleet sshconfig\n\nRegenerates %s and the shell aliases from the current host list.\n' "$AF_SSH_CONF"; return 0 ;;
