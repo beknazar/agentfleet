@@ -57,6 +57,7 @@ h1 span{color:var(--dim);font-weight:300}
 .vitals b{color:var(--sky-soft);font-weight:500}
 .vitals .alarm{color:var(--warn)}
 .vitals .stale{color:var(--warn)}
+.agewarn{display:block;color:var(--warn);opacity:.75;font-size:.72rem;letter-spacing:.02em}
 #stamp{font:inherit;color:var(--muted);background:none;border:0;padding:0;cursor:pointer;text-align:left}
 #stamp:hover{color:var(--sky)}
 
@@ -381,6 +382,9 @@ const esc = s => String(s ?? '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;
 const TUNE = {
   pollMs: 9000, sessionPollMs: 6000, jobPollMs: 2500,
   staleMs: 26000,        // no successful fetch for this long: say so, do not lie
+  summaryStaleSec: 180,  // a MACHINE's answer older than this is called out on its
+                         // row. Several collector intervals, so one missed tick is
+                         // silent but a dead timer is not.
   jobWindowMs: 600000,   // finished jobs older than this leave the strip
   bootHintMs: 8000,
   flashMs: 7000,
@@ -633,9 +637,20 @@ function cellsFor(v, st) {
     const asked = humanTask(v.task)
     const task = cut(asked, 120)
     const needs = line(needsOf(v), 120)
+    // How old the MACHINE's answer is, which is not what the header stamp says.
+    // The stamp is when the dashboard last probed; this is when the machine last
+    // thought. A collector whose timer is dead keeps serving its final answer
+    // forever, and the row is indistinguishable from a fresh one - a stopped
+    // collector once left a whole fleet reading an hour stale while the header
+    // ticked every nine seconds. Only shown once it exceeds the threshold, so
+    // the healthy case stays quiet.
+    const age = Number(v.summaryAgeSec)
+    const stale = Number.isFinite(age) && age >= TUNE.summaryStaleSec
+      ? `<span class="agewarn" title="This machine's collector last wrote ${age}s ago. Its timer may be dead: systemctl --user status agentfleet-status.timer">collector ${esc(ago(age))}</span>`
+      : ''
     out.act =
       (sum ? `<span class="sum" title="${esc(scrub(v.summary))}">${esc(sum)}</span>`
-           : `<span class="sum none">no summary yet</span>`) +
+           : `<span class="sum none">no summary yet</span>`) + stale +
       (needs ? `<span class="needs" title="${esc(needs)}">${esc(needs)}</span>` : '') +
       (task ? `<span class="task" title="${esc(asked)}">${esc(task)}</span>` : '')
 

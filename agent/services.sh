@@ -159,12 +159,26 @@ fi
 if ! command -v ttyd >/dev/null 2>&1; then
   bad "ttyd is not installed - no web terminal on this machine"
 else
-  if ip link show tailscale0 >/dev/null 2>&1; then
+  # Debian and Ubuntu's ttyd package ships its OWN system unit, enabled and
+  # started by the install, running `ttyd -i lo -p 7681 -O login` from
+  # /etc/default/ttyd. That is the same port this unit wants, so ours can never
+  # bind and Restart=always turns it into a permanent crash loop on a machine
+  # that otherwise provisioned green. Ours serves the agent's tmux session and
+  # theirs serves a login prompt, so the distro one goes.
+  if systemctl cat ttyd.service >/dev/null 2>&1; then
+    sudo systemctl disable --now ttyd.service >/dev/null 2>&1
+    say "web terminal: disabled the distro ttyd.service that was holding port $AF_TERM_PORT"
+  fi
+  # The ADDRESS, not the interface. `agentfleet provision` installs tailscale
+  # before the machine joins a tailnet - and without a reusable auth key it may
+  # never join - so tailscale0 exists with no address on it. ttyd then binds a
+  # wildcard instead and fails, which is the same crash loop by another route.
+  if [ -n "$(ip -4 -o addr show tailscale0 2>/dev/null | awk '{print $4}' | head -1)" ]; then
     TTYD_IFACE=tailscale0
     TTYD_NOTE="tailnet only"
   else
     TTYD_IFACE=lo
-    TTYD_NOTE="loopback only, no tailnet interface here; reach it with ssh -L $AF_TERM_PORT:localhost:$AF_TERM_PORT"
+    TTYD_NOTE="loopback only, no tailnet address here; reach it with ssh -L $AF_TERM_PORT:localhost:$AF_TERM_PORT"
   fi
   cat >"$UNIT_DIR/$AF_NAME-ttyd.service" <<EOF
 [Unit]
@@ -271,6 +285,15 @@ sleep 5
 
 for u in $units; do
   state="$(systemctl --user is-active "$u" 2>/dev/null)"
+  # `activating` is two different things. A unit still coming up is fine; a
+  # Restart=always unit in auto-restart has already died and is on its way back
+  # to dying again, and is-active calls that "activating" forever. Reporting it
+  # as a pass is how a machine provisions green with no web terminal on it.
+  sub="$(systemctl --user show "$u" -p SubState --value 2>/dev/null)"
+  if [ "$state" = activating ] && [ "$sub" = auto-restart ]; then
+    bad "$u: crash-looping ($(systemctl --user show "$u" -p NRestarts --value 2>/dev/null) restarts - journalctl --user -u $u)"
+    continue
+  fi
   case "$state" in
     active|activating|waiting) say "$u: $state" ;;
     *) bad "$u: $state ($(systemctl --user is-failed "$u" 2>/dev/null) - journalctl --user -u $u)" ;;

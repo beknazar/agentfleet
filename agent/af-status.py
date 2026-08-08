@@ -686,7 +686,15 @@ def pane_tail():
     if out.returncode != 0:
         # tmux exits nonzero when no server is running. That is an authoritative
         # zero sessions, not a broken probe.
-        if "no server running" in (out.stderr or "").lower():
+        #
+        # Two spellings, and the second one is the common case: tmux says "no
+        # server running on <socket>" only once its socket directory exists, and
+        # on a machine where tmux has never been started there is no directory
+        # to look in - it says "error connecting to /tmp/tmux-1000/default (No
+        # such file or directory)" instead. Reading that as a failed probe made
+        # every freshly provisioned machine report `unknown` rather than `idle`.
+        err = (out.stderr or "").lower()
+        if "no server running" in err or "no such file or directory" in err:
             return "", [], 0
         return "", [], -1
 
