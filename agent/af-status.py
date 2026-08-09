@@ -255,6 +255,151 @@ def harness_only(raw):
     return not HAS_WORD.search(body)
 
 
+# ---------------------------------------------------------------- pasted-call reject
+# A human-role turn shaped like pasted conversation - a call transcript, a chat
+# log, a greeting-heavy back-and-forth - is not an instruction, even though it
+# carries no harness tag for harness_only() to catch. Read back to the operator
+# as "your latest request" it is noise ("what was my request there?" answered
+# with "Hey, good good, nice to meet you"); fed to the summarizer it describes
+# the wrong work. So it falls through to the previous genuine human turn, exactly
+# as a harness notification does - shared through not_an_instruction() below.
+#
+# The discriminator is SHAPE, never length, and never question count. A real
+# multi-sentence instruction - even a long debugging ask that is full of
+# questions and opens with an ordinary word ("why is staging still broken? did
+# that migration apply...") - must pass. The old code failed exactly there: it
+# rejected on question count plus a non-imperative head, so genuine
+# question-dense instructions vanished; and it leaned on a broad imperative
+# head-whitelist (then/now/we/the...), so a paste opening with one of those
+# words slipped through. The bias is toward PASS: a shown piece of garbage is
+# annoying, a hidden real instruction is worse. Two precise signals decide it:
+#   * transcript structure - conversational speaker labels or clock timestamps,
+#   * SOCIAL-PLEASANTRY density - greetings, farewells, backchannels and address
+#     terms, counted across families. A pasted call is dense with these across
+#     several families; a real instruction carries technical nouns and at most a
+#     stray "yeah" or "thanks" in one family.
+
+# Four families of social-pleasantry markers. A real work instruction hits none
+# of these, or one stray marker in one family; a pasted call hits many across
+# several families. Each family is counted separately so the reject can require
+# breadth (two families) rather than a single word repeated.
+_GREETING_MARK = re.compile(
+    r"\b(?:hey+|hello|howdy)\b"
+    r"|how(?:'?s| is| are| have|'?re| you)?\s+"
+    r"(?:you|it going|things|been|are things|you been|you doing|you holding up|have you been)"
+    r"|how'?s\s+(?:the|things)\b"
+    r"|nice to (?:meet|see)(?: you)?"
+    r"|(?:good|great|nice) to (?:see|meet) you"
+    r"|(?:great|good) to connect"
+    r"|long time no see"
+    r"|(?:been|its been)\s+(?:ages|way too long|too long)"
+    r"|good (?:morning|afternoon|evening|night)",
+    re.I)
+_FAREWELL_MARK = re.compile(
+    r"talk (?:to you )?(?:soon|later)"
+    r"|take care"
+    r"|\bcheers\b"
+    r"|see you(?: soon| later| around)?"
+    r"|catch up"
+    r"|(?:great|good) seeing you",
+    re.I)
+_BACKCHANNEL_MARK = re.compile(
+    r"\bhaha+\b|\blol\b"
+    r"|\b(?:yeah|yep|yup|nah|nope)\b"
+    r"|oh (?:nice|cool|man|thats|you know)"
+    r"|good[,.\s]+good"
+    r"|no worries|no problem"
+    r"|for sure|cool cool|busy busy"
+    r"|sounds good|glad to hear|my pleasure"
+    r"|\btotally\b|\bi bet\b|you know how it is",
+    re.I)
+_ADDRESS_MARK = re.compile(r"\b(?:man|buddy|friend|dude|bro|pal|mate)\b", re.I)
+_SOCIAL_FAMILIES = (_GREETING_MARK, _FAREWELL_MARK, _BACKCHANNEL_MARK, _ADDRESS_MARK)
+
+
+def _social_markers(raw):
+    """(families_hit, distinct_markers) across the four social-pleasantry
+    families. Distinct so a word repeated ten times ("yeah ... yeah ... yeah")
+    counts once, and breadth across families is what marks conversation."""
+    families = 0
+    distinct = set()
+    for rx in _SOCIAL_FAMILIES:
+        hits = {m.group(0).lower() for m in rx.finditer(raw)}
+        if hits:
+            families += 1
+            distinct |= hits
+    return families, len(distinct)
+
+
+# Speaker labels only for a whitelist of conversational roles - a customer call
+# reads "Agent:" / "Caller:". Instruction labels a person types (Task:, Context:,
+# Notes:, Acceptance:) are deliberately NOT here, so a structured instruction is
+# never mistaken for a transcript.
+_SPEAKER = re.compile(
+    r"(?:^|\n)\s*(?:speaker\s*\d*|caller|callee|agent|customer|client"
+    r"|rep(?:resentative)?|host|guest|interviewer|interviewee|operator)\s*:",
+    re.I)
+
+_TIMESTAMP = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)")
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*")
+
+# Past the length of a typed instruction. Below it the density test does not run
+# - a short paste and a short instruction are indistinguishable, and the
+# confirmed incident is a long paste - so a terse imperative ("run the tests")
+# is permanently safe. The one exception is a short turn SATURATED with social
+# markers across families (a clipped call greeting), which still rejects.
+PASTE_MIN_WORDS = 40
+
+
+def looks_like_pasted_conversation(raw):
+    """True when a human-role turn reads as pasted conversation, not a command.
+
+    Discriminates on SOCIAL-PLEASANTRY density, never on question count and never
+    on an imperative-head whitelist. A long, question-dense debugging ask with
+    technical nouns and no social cluster PASSES, whatever word it opens with; a
+    pasted call is dense with greetings, farewells, backchannels and address
+    terms across several families and REJECTS. Called on the RAW turn (before
+    scrub) at the same points harness_only() is, and again defensively on the
+    digest turns, so a paste can reach neither the recorded instruction nor the
+    summarizer input.
+    """
+    if not raw:
+        return False
+    n = len(_WORD_RE.findall(raw))
+    if n == 0:
+        return False
+    families, distinct = _social_markers(raw)
+
+    # Short turns pass, EXCEPT a clipped call greeting saturated with social
+    # markers across at least two families.
+    if n < PASTE_MIN_WORDS:
+        return families >= 2 and distinct >= 4
+
+    # Transcript structure is decisive on its own at this length.
+    if len(_SPEAKER.findall(raw)) >= 2:
+        return True
+    if len(_TIMESTAMP.findall(raw)) >= 3:
+        return True
+
+    # Social-marker density: breadth across families, or several markers total
+    # scaled to length. A lone stray "yeah" or "thanks" (one family, one marker)
+    # never crosses either gate.
+    if families >= 2 and distinct >= 3:
+        return True
+    if distinct >= max(5, n // 20):
+        return True
+    return False
+
+
+def not_an_instruction(raw):
+    """A human-role turn that must NOT become task, lastInstruction, or a digest
+    turn: either written by the harness (harness_only) or pasted conversation
+    (looks_like_pasted_conversation). Both fall through to the previous genuine
+    human turn the same way - one gate, one behaviour, no parallel system."""
+    return harness_only(raw) or looks_like_pasted_conversation(raw)
+
+
 def text_of(content):
     """Concatenate the text blocks of a message, ignoring everything else.
     Codex labels its blocks input_text/output_text, Claude Code uses text."""
@@ -407,7 +552,7 @@ def claude_entry(e, f, ctx):
         if f["task_ts"]:
             return
         raw = e.get("lastPrompt") or ""
-        if harness_only(raw):
+        if not_an_instruction(raw):
             return
         p = scrub(raw)
         if p and not _noisy(p, CLAUDE_NOISE):
@@ -439,8 +584,9 @@ def claude_entry(e, f, ctx):
                         raw if isinstance(raw, str) else text_of(raw))[:200]
         raw = text_of(content)
         # Tested on the RAW text, before scrub() takes the tags off: once they
-        # are gone a notification is indistinguishable from a sentence.
-        if harness_only(raw):
+        # are gone a notification is indistinguishable from a sentence. The same
+        # gate also drops a pasted call transcript, which carries no tag at all.
+        if not_an_instruction(raw):
             # Not a human turn at all, so nothing is recorded and `task` keeps
             # the previous genuine instruction. Emitting "" here would blank the
             # field every time a background command reported back.
@@ -470,7 +616,7 @@ def codex_entry(e, f, ctx):
             m = CODEX_REQUEST.search(raw)
             if m:
                 raw = raw[m.end():]
-            if harness_only(raw):
+            if not_an_instruction(raw):
                 return
             body = scrub(raw).strip()
             if not _noisy(body, CODEX_NOISE):
@@ -502,7 +648,7 @@ def codex_entry(e, f, ctx):
         if role not in ("user", "assistant"):
             return
         raw = text_of(p.get("content"))
-        if role == "user" and harness_only(raw):
+        if role == "user" and not_an_instruction(raw):
             return
         body = scrub(raw).strip()
         if role == "user" and _noisy(body, CODEX_NOISE):
@@ -1196,6 +1342,13 @@ def build_digest(f, state, activity=""):
         parts.append("Queued by the human: " + f["queued"])
     parts.append("--- last turns (oldest first) ---")
     for who, body in f["turns"][-MAX_TURNS:]:
+        # Same cleaned view Fix 1 records into `task`, applied again here so the
+        # summarizer input can never be a pasted call transcript even if a future
+        # code path lets one into f["turns"]. Fix 1 already gates this at the
+        # adapter; this keeps the guarantee local to the summarizer, so turning
+        # AF_SUMMARY_PROVIDER on later cannot make the model summarize the paste.
+        if who == "human" and looks_like_pasted_conversation(body):
+            continue
         tag = {"human": "HUMAN", "agent": "AGENT", "tool": "TOOL "}.get(who, "OTHER")
         parts.append("%s: %s" % (tag, body[:600]))
     if f["last_error"]:
@@ -1365,6 +1518,103 @@ NOISE_FIXTURES = [
     ('run the tests and report back', False),
 ]
 
+# The hard fixtures the verifier bakes in, labeled so each result prints. False
+# = a genuine instruction that MUST PASS (the old code wrongly hid these -
+# question-dense debugging asks with no imperative head); True = pasted chat/call
+# that MUST REJECT, including ones opening with a word the old whitelist trusted
+# (then/now/we). The discriminator is social-pleasantry density, never question
+# count and never the opening word.
+HARD_FIXTURES = [
+    ("P1", False,
+     "why is staging still broken? did that migration apply or not? does anyone "
+     "know if our revision serves traffic? I keep seeing errors and cannot figure "
+     "out from here whether it deployed at all last night during that whole messy "
+     "incident window."),
+    ("P2", False,
+     "this whole auth flow feels wrong to me after yesterday. did you ever land "
+     "the timeout fix on that flaky worker test? does the suite pass green now? "
+     "and honestly why is the retry wrapper still not covering the path we "
+     "identified during the review last week?"),
+    ("P3", False,
+     "honestly that benchmarks page still looks off. is the voice catalog pulling "
+     "the new rows? did biome pass on that branch? does the latency column read "
+     "from the cached table or the live one? something regressed since yesterday "
+     "and I want to know what."),
+    ("R1", True,
+     "hey man so good to finally catch up, how have you been? yeah its been way "
+     "too long honestly. oh nice, yeah I heard you moved to the city. hows the "
+     "new place treating you? haha yeah I bet. anyway did you want to grab coffee "
+     "sometime next week? sounds good, talk soon, take care."),
+    ("R2", True,
+     "so then I was thinking, how are you doing these days man? yeah its been ages "
+     "honestly, nice to see you around again. oh you know how it is, busy busy. "
+     "haha yeah for sure. anyway hows the family? good good, glad to hear it, talk "
+     "soon okay take care buddy."),
+    ("R3", True,
+     "now listen, how have you been holding up lately? oh man yeah I totally get "
+     "that, no worries at all. nice to meet you finally after all these emails "
+     "haha. yeah so great to connect. hows things on your side? cool cool, sounds "
+     "good, cheers, talk to you soon."),
+    ("R4", True,
+     "we should totally catch up soon, how are things going with you? yeah nice, "
+     "oh thats awesome to hear honestly. haha yeah no problem at all my friend. "
+     "hows the weather over there? oh nice, okay well take care, talk soon, great "
+     "seeing you around again buddy."),
+    ("R5", True,
+     "Hey Good, good, good. Nice to meet you back. Are you in SF right now or? "
+     "Birth? Hey, how are you? Nice to meet you, man."),
+]
+
+# The shape-based reject (Fix 1). True = pasted conversation, must NOT become an
+# instruction; False = a genuine instruction, must pass. The discriminator is
+# "conversation-shaped", never "long", so the PASS side deliberately includes a
+# long imperative and a long declarative technical instruction - length alone
+# must not reject either.
+PASTE_FIXTURES = [
+    # The primary reject fixture: a customer-call transcript pasted into a coding
+    # session and read back to the operator as "your latest request". Greeting
+    # and question dense, no imperative head - no speaker labels or timestamps,
+    # so it is caught purely by the chatter/question path.
+    ("Hey Good, good, good. Nice to meet you back. Are you in SF right now or? "
+     "Birth? Hey, how are you? Nice to meet you, man. I am, yeah, I am in the "
+     "sub, I am actually in the airport. I am in the airport right now. Yeah. "
+     "Oh. Okay. That is nice. Nice. Going to the conference tomorrow on voice. "
+     "Awesome. Yeah, yeah. Yeah, I was just testing out some other companies' "
+     "voice AI, and I'm like, hmm, ours defi", True),
+    # A two-speaker call transcript with conversational speaker labels.
+    ("Agent: Thanks for calling, how can I help you today?\n"
+     "Caller: Hi there, yeah, I was hoping to ask about your pricing.\n"
+     "Agent: Of course, happy to help. Are you looking at the monthly plan?\n"
+     "Caller: Yeah, I think so, but I had a couple of questions first.\n"
+     "Agent: Sure, go ahead, take your time.\n"
+     "Caller: Great, thanks so much, really appreciate it.", True),
+    # A greetings-heavy small-talk blob, no structure and no imperative head.
+    ("Hey hey! Good morning, how are you doing today? Nice to meet you, so great "
+     "to see you again after all this time. Yeah, thanks so much, awesome, "
+     "really appreciate it. How's it going on your end, how have you been "
+     "lately? Oh cool, okay, yeah sounds good to me. Haha, no worries at all, "
+     "talk to you soon, take care, cheers for now.", True),
+    # PASS: a short imperative and a comma-chained short instruction.
+    ("continue task 13, voices V2, then check Cloud Run", False),
+    ("fix the flaky auth test in worker.ts", False),
+    ("run the tests and report back", False),
+    # PASS: a long, multi-sentence imperative instruction. Long, but it opens
+    # like a command and is not conversation-shaped, so it must not be rejected.
+    ("Continue task 13, the voices V2 closing work. First rebase onto main, then "
+     "run the worker test suite in worker-ts and fix any failures you find. "
+     "After that, check the Cloud Run revision and redeploy if the migration did "
+     "not apply cleanly. Report back when the whole suite passes and the "
+     "revision is serving traffic again.", False),
+    # PASS: a long, multi-sentence DECLARATIVE technical instruction - no
+    # imperative verb at the head, proving the reject is not just an
+    # imperative-start check. Low filler, no question flood, so it passes.
+    ("The migration in packages/db keeps failing on staging because the enum "
+     "column was renamed twice and the down migration was never regenerated. "
+     "The retry wrapper we added last week does not cover the timeout path, so "
+     "the deploy hangs instead of surfacing the error. A fresh baseline against "
+     "a clean branch is what this needs before the next release tag.", False),
+]
+
 
 def selftest():
     ok = True
@@ -1419,6 +1669,73 @@ def selftest():
     if g["task"] != "go all":
         ok = False
         print("FAIL last-prompt dropped when it is the only human text: %r" % g["task"])
+
+    # ---- Fix 1: the shape-based pasted-conversation reject, both directions.
+    # The labeled hard fixtures print one line each so the verifier sees every
+    # P#/R# verdict.
+    for label, want, raw in HARD_FIXTURES:
+        got = looks_like_pasted_conversation(raw)
+        fam, dist = _social_markers(raw)
+        verdict = "REJECT" if got else "PASS"
+        expect = "REJECT" if want else "PASS"
+        good = got == want
+        if not good:
+            ok = False
+        print("%s %s got=%s want=%s (families=%d markers=%d)"
+              % ("ok  " if good else "FAIL", label, verdict, expect, fam, dist))
+
+    for raw, want in PASTE_FIXTURES:
+        got = looks_like_pasted_conversation(raw)
+        if got != want:
+            ok = False
+            verb = "rejected" if got else "passed"
+            print("FAIL pasted-reject %s (want %s): %r" % (verb, want, raw[:70]))
+
+    # End to end: a real instruction, then a pasted call transcript on the
+    # human's role. The paste must NOT become the instruction and must NOT reach
+    # the digest turns - `task` stays the previous genuine instruction.
+    poison = next(raw for raw, want in PASTE_FIXTURES if want)
+    h = {"title": "", "task": "", "task_ts": 0.0, "turns": [], "tool": "",
+         "last_text": "", "last_role": "", "last_ts": 0.0, "entry_ts": 0.0,
+         "pending_tools": [], "last_error": "", "queued": ""}
+    hctx = {"pending": {}, "alt": [], "saw_events": False}
+    real = "fix the flaky auth test in worker.ts, then redeploy"
+    h["entry_ts"] = time.time() - 120
+    claude_entry({"type": "user", "message": {"role": "user", "content": real}}, h, hctx)
+    h["entry_ts"] = time.time()
+    claude_entry({"type": "user", "message": {"role": "user", "content": poison}}, h, hctx)
+    if h["task"] != real:
+        ok = False
+        print("FAIL pasted call became the instruction: %r" % h["task"][:90])
+    if [t for t in h["turns"] if t[0] == "human"] != [("human", real)]:
+        ok = False
+        print("FAIL pasted call reached the model digest: %r" % (h["turns"],))
+
+    # With the pasted call as the ONLY human turn in the tail, there is no clean
+    # instruction: lastInstruction is "" and its age is -1, never the garbage.
+    e = {"title": "", "task": "", "task_ts": 0.0, "turns": [], "tool": "",
+         "last_text": "", "last_role": "", "last_ts": 0.0, "entry_ts": 0.0,
+         "pending_tools": [], "last_error": "", "queued": ""}
+    ectx = {"pending": {}, "alt": [], "saw_events": False}
+    e["entry_ts"] = time.time()
+    claude_entry({"type": "user", "message": {"role": "user", "content": poison}}, e, ectx)
+    if e["task"] != "" or instruction_age(e["task_ts"]) != -1:
+        ok = False
+        print("FAIL no-clean-instruction: task=%r age=%s (want '' and -1)"
+              % (e["task"][:40], instruction_age(e["task_ts"])))
+
+    # ---- Fix 2: the summarizer digest excludes a pasted call even if one is
+    # forced into f["turns"], so enabling AF_SUMMARY_PROVIDER cannot summarize it.
+    d = {"title": "", "task": "", "task_ts": 0.0, "queued": "", "last_error": "",
+         "last_text": "wired the retry loop in worker-ts and reran the suite",
+         "turns": [("human", real), ("human", poison), ("agent", "on it")]}
+    digest = build_digest(d, "working", "")
+    if poison[:30] in digest:
+        ok = False
+        print("FAIL pasted call reached the summarizer digest")
+    if real not in digest:
+        ok = False
+        print("FAIL real instruction dropped from the summarizer digest")
 
     procs = live_agent_count()
     print("live_agent_count(%s) = %s" % (AGENT, procs))
