@@ -24,6 +24,7 @@ AF_NODE_VERSION="${AF_NODE_VERSION:-22}"
 AF_PKG_EXTRA="${AF_PKG_EXTRA:-}"
 AF_NPM_EXTRA="${AF_NPM_EXTRA:-}"
 AF_BROWSER="${AF_BROWSER:-0}"
+AF_AZURE_CLI="${AF_AZURE_CLI:-auto}"
 
 # Pinned so an upstream release cannot change what every machine in the fleet
 # installs on the same afternoon. Bump deliberately.
@@ -64,6 +65,49 @@ if [ -n "$AF_PKG_EXTRA" ]; then
   log "apt: extras ($AF_PKG_EXTRA)"
   # shellcheck disable=SC2086
   sudo apt-get install -y -qq $AF_PKG_EXTRA
+fi
+
+# ---------------------------------------------------------------- azure cli
+
+# Deliberately not core. agentfleet runs on any provider, most fleets are not on
+# Azure, and az is not in the distro repo at all - it comes from Microsoft's own
+# apt source, so making it core adds a third-party repo to every machine anyone
+# ever provisions.
+#
+# It is not opt-in either, because forgetting the flag is the bug: an Azure
+# machine that lacks az cannot read a secret from Key Vault no matter how its
+# permissions are set, and a fleet has already run in that state without anyone
+# noticing. agentfleet gives each Azure VM a managed identity precisely so
+# `az login --identity` works there, and without the binary that promise is
+# empty.
+#
+# So: auto installs it only on an Azure VM. Detection is the DMI chassis asset
+# tag Azure stamps on every instance - world-readable, no network call, and no
+# IMDS timeout to sit through on the machines that are not on Azure. 1 forces
+# the install anywhere, 0 refuses it anywhere.
+AZURE_ASSET_TAG="7783-7084-3265-9085-8269-3286-77"
+az_wanted=0
+case "$AF_AZURE_CLI" in
+  1) az_wanted=1 ;;
+  0) ;;
+  auto)
+    if [ "$(cat /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true)" = "$AZURE_ASSET_TAG" ]; then
+      az_wanted=1
+    fi
+    ;;
+  *) die "unknown AF_AZURE_CLI: $AF_AZURE_CLI (auto, 1, 0)" ;;
+esac
+
+if [ "$az_wanted" = 1 ] && ! command -v az >/dev/null 2>&1; then
+  log "azure cli (vendor installer, not a snap)"
+  # The installer runs apt itself and traces every line it runs, so its output
+  # goes to a file rather than into the middle of the provision log. The verify
+  # step below is what turns a failure here into a failed provision.
+  # The redirect is grouped so it belongs to the pipeline, not to sudo: the log
+  # is written as the invoking user, into a directory that user can write.
+  if ! { curl -fsSL https://aka.ms/InstallAzureCLIDeb | sudo bash; } >"/tmp/$AF_NAME-azure-cli.log" 2>&1; then
+    log "WARN: azure cli install failed, see /tmp/$AF_NAME-azure-cli.log on this machine"
+  fi
 fi
 
 # ---------------------------------------------------------------- node
@@ -164,13 +208,20 @@ missing=""
 # BINARY names, not package names. The apt package is `ripgrep` and the only
 # thing it puts on PATH is `rg`, so checking for `ripgrep` here failed on every
 # machine and turned a successful ten-minute provision into "NOT provisioned".
-# Anything added below must be the name you would type, not the name you install.
+# Anything added below must be the name you would type, not the name you install:
+# the azure-cli package puts `az` on PATH, and checking for `azure-cli` would
+# repeat the same mistake.
 CHECK="git jq tmux rsync rg python3 node npm ttyd"
 case "$AF_AGENT" in
   claude) CHECK="$CHECK claude" ;;
   codex)  CHECK="$CHECK codex" ;;
   both)   CHECK="$CHECK claude codex" ;;
 esac
+# Verified only where it was meant to be installed. A machine that silently
+# lacks az is exactly the failure this section exists to stop, so on Azure a
+# missing az now fails the provision instead of surfacing weeks later as an
+# unreadable secret.
+if [ "$az_wanted" = 1 ]; then CHECK="$CHECK az"; fi
 for c in $CHECK; do
   if ! command -v "$c" >/dev/null 2>&1; then missing="$missing $c"; fi
 done

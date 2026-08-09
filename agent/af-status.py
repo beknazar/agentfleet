@@ -37,6 +37,7 @@ scanning ten of them.
     af-status.py --cached   # dashboard path: print the cache with a fresh idleSec
     af-status.py --no-llm   # deterministic only, never spend a token
     af-status.py --work     # just the screen-scraped work signals, for debugging
+    af-status.py --selftest # run the transcript-noise regression fixtures
 """
 import copy
 import glob
@@ -200,15 +201,58 @@ CMD_BLOCK = re.compile(r"<command-[a-z-]+>.*?</command-[a-z-]+>", re.S)
 REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 B64 = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
 
+# Every harness wrapper tag is hyphenated - task-notification, tool-use-id,
+# output-file, system-reminder, local-command-stdout - while real markup a
+# person types in a prompt is not. So strip the hyphenated family WHOLESALE
+# rather than chase each new tag the harness invents; the named blocks above
+# were exactly that chase, and a `<task-notification>` walked straight past
+# them into the task column. This is the same rule the dashboard's sanitizer
+# already applies, and it has to exist in both places: the dashboard cleans
+# what it DISPLAYS, this cleans what the field MEANS.
+HARNESS_TAG = re.compile(r"</?[a-z][a-z0-9]*(?:-[a-z0-9]+)+[^>]*>", re.I)
+# The same family with its contents: <tag ...> anything </tag>. Non-greedy and
+# backreferenced, so a nested notification is consumed by its outer wrapper.
+HARNESS_BLOCK = re.compile(r"<([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b[^>]*>.*?</\1\s*>", re.S | re.I)
+HARNESS_OPEN = re.compile(r"^\s*<[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b", re.I)
+HAS_WORD = re.compile(r"[A-Za-z0-9]")
+
 
 def scrub(s):
     """Strip the machinery before anything else sees the text. Also caps input
     cost: one pasted image would otherwise blow the digest budget on its own."""
     s = REMINDER.sub("", s)
     s = CMD_BLOCK.sub("", s)
+    s = HARNESS_TAG.sub(" ", s)
     s = IMAGE_ARTIFACT.sub("", s)
     s = B64.sub("<blob>", s)
     return fold_ascii(s)
+
+
+def harness_only(raw):
+    """True when a turn sitting on the HUMAN's role was written by the harness.
+
+    Stripping the tags is not enough on its own, and that is the whole trap. A
+    completed background task arrives as a user message that is nothing but
+    `<task-notification>...<summary>Background command "X" completed</summary>
+    </task-notification>`; delete the tags and what is left is a fluent English
+    sentence that reads exactly like something a person typed. It then becomes
+    `task`, and the operator asking "what was the last message I gave that
+    machine" is read back a notification he never wrote.
+
+    So this decides the question the tag filter cannot: was the WHOLE turn
+    machine-generated? Two ways to be sure. Nothing but hyphenated wrapper
+    blocks and their ids, or a turn that OPENS with a hyphenated wrapper - a
+    person does not begin a prompt with `<some-tag>`, and if one ever does, the
+    cost is that his previous instruction stands rather than his newest, which
+    is the survivable direction. Guessing wrong the other way puts machine
+    noise in his ear as his own words.
+    """
+    if not raw:
+        return False
+    if HARNESS_OPEN.search(raw):
+        return True
+    body = HARNESS_TAG.sub(" ", HARNESS_BLOCK.sub(" ", raw))
+    return not HAS_WORD.search(body)
 
 
 def text_of(content):
@@ -307,8 +351,19 @@ def _noisy(body, noise):
 # The three events every adapter reports, and the facts each one updates. An
 # adapter below only has to say WHICH of its entries is a human turn, an agent
 # turn or a tool call.
-def add_human(f, body):
+def set_task(f, body):
+    """The standing instruction, and when it arrived.
+
+    parse() sets entry_ts before every entry. A ts of 0 means the entry carried
+    no clock of its own - `last-prompt` records do not - and an unknown age is
+    then reported as unknown rather than as "just now".
+    """
     f["task"] = body
+    f["task_ts"] = f.get("entry_ts", 0.0)
+
+
+def add_human(f, body):
+    set_task(f, body)
     f["turns"].append(("human", body))
     f["last_role"] = "user"
 
@@ -335,11 +390,28 @@ def claude_entry(e, f, ctx):
         f["title"] = fold_ascii(e.get("aiTitle") or "")
         return
     if etype == "last-prompt":
-        # Same filter as the human role below: a dragged screenshot path or a
-        # slash command is not the task, and reads as garbage on a dashboard.
-        p = scrub(e.get("lastPrompt") or "")
+        # Same filter as the human role below: a dragged screenshot path, a
+        # slash command or a harness notification is not the task, and reads as
+        # garbage on a dashboard.
+        #
+        # A FALLBACK, not an override, and that is measured rather than
+        # assumed. The agent rewrites this record periodically with whatever it
+        # last saw, so a stale copy keeps landing AFTER newer turns: on one machine it
+        # pinned `task` to "go all" while the operator's live instruction, dated
+        # minutes earlier in the same tail, was "Continue task #13 (voices V2
+        # closing)". It also carries no timestamp, so letting it win throws away
+        # the age of an instruction we do know the age of. It never holds
+        # anything a dated turn does not - the harness writes both when the
+        # human hits enter - so it is only consulted when the tail window
+        # contains no dated human turn at all.
+        if f["task_ts"]:
+            return
+        raw = e.get("lastPrompt") or ""
+        if harness_only(raw):
+            return
+        p = scrub(raw)
         if p and not _noisy(p, CLAUDE_NOISE):
-            f["task"] = p
+            set_task(f, p)
         return
     if etype == "queue-operation":
         # A consumed queue entry that is never cleared keeps showing up in the
@@ -365,7 +437,15 @@ def claude_entry(e, f, ctx):
                     raw = b.get("content")
                     f["last_error"] = scrub(
                         raw if isinstance(raw, str) else text_of(raw))[:200]
-        body = scrub(text_of(content)).strip()
+        raw = text_of(content)
+        # Tested on the RAW text, before scrub() takes the tags off: once they
+        # are gone a notification is indistinguishable from a sentence.
+        if harness_only(raw):
+            # Not a human turn at all, so nothing is recorded and `task` keeps
+            # the previous genuine instruction. Emitting "" here would blank the
+            # field every time a background command reported back.
+            return
+        body = scrub(raw).strip()
         if not _noisy(body, CLAUDE_NOISE):
             add_human(f, body)
 
@@ -390,6 +470,8 @@ def codex_entry(e, f, ctx):
             m = CODEX_REQUEST.search(raw)
             if m:
                 raw = raw[m.end():]
+            if harness_only(raw):
+                return
             body = scrub(raw).strip()
             if not _noisy(body, CODEX_NOISE):
                 add_human(f, body)
@@ -419,7 +501,10 @@ def codex_entry(e, f, ctx):
         role = p.get("role")
         if role not in ("user", "assistant"):
             return
-        body = scrub(text_of(p.get("content"))).strip()
+        raw = text_of(p.get("content"))
+        if role == "user" and harness_only(raw):
+            return
+        body = scrub(raw).strip()
         if role == "user" and _noisy(body, CODEX_NOISE):
             return
         if body:
@@ -557,8 +642,8 @@ def parse(path):
     """Walk the transcript tail into the facts the state machine and the model
     prompt both need. One pass, no model."""
     f = {
-        "title": "", "task": "", "turns": [], "tool": "",
-        "last_text": "", "last_role": "", "last_ts": 0.0,
+        "title": "", "task": "", "task_ts": 0.0, "turns": [], "tool": "",
+        "last_text": "", "last_role": "", "last_ts": 0.0, "entry_ts": 0.0,
         "pending_tools": [], "last_error": "", "queued": "",
     }
     ctx = {"pending": {}, "alt": [], "saw_events": False}
@@ -578,13 +663,19 @@ def parse(path):
             continue
         try:
             ts = e.get("timestamp")
-            if ts:
-                f["last_ts"] = max(f["last_ts"], iso_epoch(ts))
+            # Handed to the adapter through f so add_human can date the
+            # instruction without every adapter having to pass it along.
+            f["entry_ts"] = iso_epoch(ts) if ts else 0.0
+            if f["entry_ts"]:
+                f["last_ts"] = max(f["last_ts"], f["entry_ts"])
             AD["entry"](e, f, ctx)
         except (AttributeError, KeyError, TypeError, ValueError):
             continue        # one malformed entry must not lose the whole tail
 
     if ctx["alt"] and not ctx["saw_events"]:
+        # Replayed out of order relative to their own entries, so the clock from
+        # the last entry read does not belong to them. Unknown, not wrong.
+        f["entry_ts"] = 0.0
         for role, body in ctx["alt"]:
             if role == "user":
                 add_human(f, body)
@@ -725,6 +816,53 @@ NO_FLAGS = {"login": False, "permission": False, "mcp": False,
             "busy": False, "error": False}
 
 
+# ---------------------------------------------------------------- live agent
+def live_agent_count():
+    """How many agent processes are running on this box right now.
+
+    This is the fact `state` is not. `done` is inferred from a transcript that
+    stopped moving; the process behind it is usually still sitting at its
+    prompt, and typing into it continues that same session. A caller told only
+    "done" concludes the session is closed and starts a new one - which is what
+    happened on a live call - so the process count ships alongside the word.
+
+    -x matches the exact process NAME. Never -f: the pattern would appear in the
+    argv of the probe's own shell, so every machine reports a constant nonzero
+    count whether an agent runs or not, and an agent exec'd as a bare name is
+    missed by a path-ish pattern anyway. The dashboard's probe uses -x for the
+    same two reasons and the two must not disagree about the same machine.
+
+    pgrep -c prints "0" AND exits 1 when nothing matches, so the count comes off
+    stdout and the exit status is ignored. -1 means the probe itself could not
+    run, which is not zero: a machine whose agent cannot be counted must not be
+    reported as having none.
+    """
+    def _pgrep(flags):
+        try:
+            p = subprocess.run(["pgrep"] + flags + [AGENT],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, timeout=5)
+        except Exception:
+            return None
+        return (p.stdout or "").strip()
+
+    out = _pgrep(["-c", "-x"])
+    if out is None:
+        return -1                       # no pgrep on this box, or it hung
+    try:
+        return max(0, int(out.splitlines()[0].strip()))
+    except (IndexError, ValueError):
+        pass
+    # -c is a procps flag and BSD pgrep does not have it - it prints a usage
+    # line to stderr and nothing to stdout. The fleet is Linux, but a collector
+    # on a Mac must not report "cannot tell" for a running agent, so count the
+    # pids instead. Same -x, same meaning, portable.
+    out = _pgrep(["-x"])
+    if out is None:
+        return -1
+    return len([ln for ln in out.splitlines() if ln.strip().isdigit()])
+
+
 # ---------------------------------------------------------------- schema
 # One declaration of the output shape. Three separate copies of this list used
 # to exist, and adding a field to two of them silently dropped it from the
@@ -734,6 +872,16 @@ DEFAULTS = {
     "state": "idle",
     "needs": "",
     "task": "",
+    # snake_case against the camelCase of its neighbours on purpose: this is the
+    # name the fleet snapshot and the voice tools already agreed on, and one
+    # renamed key is a field that silently reads undefined at the far end.
+    "has_live_agent": False,
+    # -1 = the process probe could not run. Distinct from 0, which is a machine
+    # with no agent on it, and from the False above, which is only the two of
+    # them collapsed for a caller that wants one boolean.
+    "agentProcs": -1,
+    "lastInstruction": "",
+    "lastInstructionAgeSec": -1,        # -1 = no instruction, or no clock on it
     "tool": "",
     "idleSec": 0,
     "sessionId": "",
@@ -972,7 +1120,16 @@ def detect_state(f, flags, idle, work, pane_moving=False):
         # transcript does not move until the tool returns, so without this the
         # row falls all the way through to `idle` on a machine mid-build.
         return "working", ""
-    if idle < WORKING_WINDOW and (f["pending_tools"] or f["last_role"] == "assistant"):
+    if idle < WORKING_WINDOW and f["pending_tools"]:
+        return "working", ""
+    if idle < WORKING_WINDOW and f["last_role"] == "assistant" and pane_moving:
+        # last_role == assistant covers BOTH "mid-thought" and "said its final
+        # sentence and parked at the prompt", and those want opposite answers.
+        # Without the pane_moving guard a finished agent reads `working` for the
+        # full 90s window while the operator is looking at an idle prompt - the
+        # spinner (busy, above) already catches genuinely active work, and a
+        # non-interactive job with no spinner is caught by the pending_tools
+        # branch, so a still screen here means it really has stopped.
         return "working", ""
 
     # 4. done - reachable only with nothing outstanding at all
@@ -1155,6 +1312,12 @@ def emit(obj):
     print(json.dumps(public(obj)))
 
 
+def instruction_age(ts):
+    """Seconds since the instruction, or -1 when the entry carried no clock.
+    Never a negative age from a machine whose clock is a little ahead."""
+    return int(max(0, time.time() - ts)) if ts else -1
+
+
 def empty(reason, state=""):
     out = copy.deepcopy(DEFAULTS)
     out["summary"] = reason
@@ -1162,6 +1325,105 @@ def empty(reason, state=""):
         out["state"] = state
     out["at"] = now_iso()
     return out
+
+
+# ---------------------------------------------------------------- selftest
+# The transcript-noise rules, against real text. Every polluted sample below is
+# copied verbatim out of a fleet transcript, because the bug this guards was a
+# wrapper nobody had thought to add to a list of literals: made-up samples pass
+# a filter written from the same imagination.
+NOISE_FIXTURES = [
+    # Captured from a real polluted transcript. This exact entry became the
+    # `task` field, and the operator asking what he last told the machine was
+    # read this back - twice, in one call.
+    ('<task-notification>\n<task-id>bit6lhnld</task-id>\n'
+     '<tool-use-id>toolu_01NcGMvafyQH8EGTxDkJbk8c</tool-use-id>\n'
+     '<output-file>/tmp/agent-run/project/'
+     'bae46a73-0093-460d-92ae-abd8a2de6088/tasks/bit6lhnld.output</output-file>\n'
+     '<status>completed</status>\n'
+     '<summary>Background command "Install dependencies in server worktree" '
+     'completed (exit code 0)</summary>\n</task-notification>', True),
+    # Same family, agent fan-out rather than a shell. The trailing <note> is the
+    # part that makes tag-stripping alone unsafe: it leaves fluent prose.
+    ('<task-notification>\n<task-id>a603b40eec398ae06</task-id>\n'
+     '<tool-use-id>toolu_01QigFATZ9fHUtGa4KAQXG7V</tool-use-id>\n'
+     '<status>completed</status>\n'
+     '<summary>Agent "Implement benchmarks voice catalog page" finished</summary>\n'
+     '<note>A task-notification fires each time one completes.</note>\n'
+     '</task-notification>', True),
+    ('<system-reminder>Your todo list has changed.</system-reminder>', True),
+    ('<local-command-stdout>ok</local-command-stdout>', True),
+    # A wrapper the harness has not invented yet. This is the whole point of the
+    # hyphenated-family rule: no literal list would have this one in it.
+    ('<some-future-wrapper><inner-id>x1</inner-id></some-future-wrapper>', True),
+    # Genuine instructions, including ones that talk ABOUT the tags and one that
+    # contains real markup. None of these may be dropped.
+    ('Continue task #13 (voices V2 closing). v0.0.357 tagged ~14 min ago.', False),
+    ('the collector keeps putting <task-notification> blocks in the task field '
+     '- strip the hyphenated family like the dashboard does', False),
+    ('fix the <div> nesting in apps/marketing/index.html', False),
+    ('run the tests and report back', False),
+]
+
+
+def selftest():
+    ok = True
+    for raw, want in NOISE_FIXTURES:
+        got = harness_only(raw)
+        if got != want:
+            ok = False
+            print("FAIL harness_only=%s want=%s: %r" % (got, want, raw[:70]))
+
+    # End to end through the adapter: one real human turn, then every harness
+    # notification above arriving on the human's role after it. `task` must
+    # still be the human turn - not a notification, and not blank.
+    f = {"title": "", "task": "", "task_ts": 0.0, "turns": [], "tool": "",
+         "last_text": "", "last_role": "", "last_ts": 0.0, "entry_ts": 0.0,
+         "pending_tools": [], "last_error": "", "queued": ""}
+    ctx = {"pending": {}, "alt": [], "saw_events": False}
+    human = "Continue task #13 (voices V2 closing), check the Cloud Run revision"
+    f["entry_ts"] = time.time() - 300
+    claude_entry({"type": "user", "message": {"role": "user", "content": human}}, f, ctx)
+    for raw, want in NOISE_FIXTURES:
+        if not want:
+            continue
+        f["entry_ts"] = time.time()
+        claude_entry({"type": "user", "message": {"role": "user", "content": raw}}, f, ctx)
+    if f["task"] != human:
+        ok = False
+        print("FAIL task fell through to noise: %r" % f["task"][:90])
+    if [t for t in f["turns"] if t[0] == "human"] != [("human", human)]:
+        ok = False
+        print("FAIL noise reached the model digest: %r" % (f["turns"],))
+    age = instruction_age(f["task_ts"])
+    if not 290 <= age <= 310:
+        ok = False
+        print("FAIL instruction age %s, expected the human turn's own clock" % age)
+
+    # A stale `last-prompt` record - clockless, and written after newer turns -
+    # must not displace a dated instruction. Observed in the field: "go all" from
+    # hours earlier overwriting the live standing ask.
+    f["entry_ts"] = 0.0
+    claude_entry({"type": "last-prompt", "lastPrompt": "go all"}, f, ctx)
+    if f["task"] != human or instruction_age(f["task_ts"]) < 290:
+        ok = False
+        print("FAIL stale last-prompt displaced a dated instruction: %r age=%s"
+              % (f["task"][:40], instruction_age(f["task_ts"])))
+
+    # With no dated turn in the tail at all it is still the best source there is.
+    g = {"title": "", "task": "", "task_ts": 0.0, "turns": [], "tool": "",
+         "last_text": "", "last_role": "", "last_ts": 0.0, "entry_ts": 0.0,
+         "pending_tools": [], "last_error": "", "queued": ""}
+    claude_entry({"type": "last-prompt", "lastPrompt": "go all"}, g,
+                 {"pending": {}, "alt": [], "saw_events": False})
+    if g["task"] != "go all":
+        ok = False
+        print("FAIL last-prompt dropped when it is the only human text: %r" % g["task"])
+
+    procs = live_agent_count()
+    print("live_agent_count(%s) = %s" % (AGENT, procs))
+    print("SELFTEST " + ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------- main
@@ -1177,6 +1439,15 @@ def cached_mode():
         mtime = cache.get("_mtime", 0)
     cache["idleSec"] = max(0, int(time.time() - max(mtime, cache.get("_last_ts", 0))))
     cache["at"] = now_iso()
+    # Both of these have to be recomputed, not served from the cache. The
+    # process count is what decides continue-vs-start-a-new-session, and an
+    # agent that exited a timer period ago would otherwise still read live; the
+    # instruction's age is a clock, and a cached clock is a stopped one.
+    procs = live_agent_count()
+    cache["agentProcs"] = procs
+    cache["has_live_agent"] = procs > 0
+    cache["lastInstructionAgeSec"] = (instruction_age(cache.get("_task_ts", 0))
+                                      if cache.get("lastInstruction") else -1)
 
     # The cache is up to one timer period old, and that is long enough for a
     # session to launch a shell after its last turn read like a completion.
@@ -1217,6 +1488,11 @@ def run(no_llm=False):
         out = empty("no %s session on this machine" % AGENT, state)
         out["needs"] = needs
         out["panes"] = panes
+        # No transcript still says nothing about the process: an agent launched
+        # a second ago has not written a turn yet.
+        procs = live_agent_count()
+        out["agentProcs"] = procs
+        out["has_live_agent"] = procs > 0
         out["shells"] = work["shells"]
         out["tasks"] = work["tasks"]
         out["agents"] = work["agents"]
@@ -1284,6 +1560,7 @@ def run(no_llm=False):
     else:
         needs = ""
 
+    procs = live_agent_count()
     out = {
         "summary": summary,
         "state": state,
@@ -1293,6 +1570,13 @@ def run(no_llm=False):
         "tasks": work["tasks"],
         "agents": work["agents"],
         "task": (f["task"] or f["title"])[:120],
+        "has_live_agent": procs > 0,
+        "agentProcs": procs,
+        # `task` falls back to the session title and is cut to a column width.
+        # This one is only ever the human's own words, and long enough to be
+        # read back to him, so a caller never has to guess which it got.
+        "lastInstruction": f["task"][:400],
+        "lastInstructionAgeSec": instruction_age(f["task_ts"]) if f["task"] else -1,
         "tool": f["tool"],
         "idleSec": idle,
         "sessionId": os.path.basename(path)[:-6],
@@ -1300,7 +1584,8 @@ def run(no_llm=False):
         "at": now_iso(),
     }
     write_cache(dict(out, _path=path, _mtime=mtime, _llm_at=llm_at,
-                     _last_ts=f["last_ts"], _pane_sig=pane_sig))
+                     _last_ts=f["last_ts"], _task_ts=f["task_ts"],
+                     _pane_sig=pane_sig))
     emit(out)
 
 
@@ -1309,6 +1594,8 @@ def main():
     if "--help" in args or "-h" in args:
         print(__doc__.strip())
         return
+    if "--selftest" in args:
+        sys.exit(selftest())
     try:
         if "--work" in args:
             work, flags, panes, _sig = screen_work()

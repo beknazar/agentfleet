@@ -463,11 +463,27 @@ function normSummary(raw) {
       running: count(a.running), finished: count(a.finished),
       names: (Array.isArray(a.names) ? a.names : []).map(n => flat(n, 60)).filter(Boolean).slice(0, 8),
     },
+    // The collector distinguishes "an agent process is running" from the state
+    // word, which is only inferred from transcript idleness. A machine can read
+    // `done` and still have a live agent sitting at its prompt - that pair is
+    // what tells a caller to continue the session rather than start a second
+    // one on top of it. Unknown stays null: agentProcs -1 means the probe could
+    // not run, and collapsing that to false is how you end up starting a
+    // duplicate agent on a busy machine.
+    hasLiveAgent: typeof o.has_live_agent === 'boolean' ? o.has_live_agent
+      : (typeof o.hasLiveAgent === 'boolean' ? o.hasLiveAgent : null),
+    agentProcs: Number.isFinite(Number(o.agentProcs)) && Number(o.agentProcs) >= 0
+      ? Number(o.agentProcs) : null,
+    lastInstruction: flat(pick('lastInstruction', 'last_instruction'), 400),
+    lastInstructionAgeSec: Number.isFinite(Number(o.lastInstructionAgeSec ?? o.last_instruction_age_sec))
+      && Number(o.lastInstructionAgeSec ?? o.last_instruction_age_sec) >= 0
+      ? Math.round(Number(o.lastInstructionAgeSec ?? o.last_instruction_age_sec)) : null,
   }
 }
 const EMPTY_SUMMARY = {
   summary: '', state: 'unknown', needs: '', task: '', tool: '', idleSec: 0,
   activity: '', shells: 0, tasks: { done: 0, inProgress: 0, open: 0 },
+  hasLiveAgent: null, agentProcs: null, lastInstruction: '', lastInstructionAgeSec: null,
   agents: { running: 0, finished: 0, names: [] },
 }
 

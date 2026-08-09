@@ -17,6 +17,10 @@ af_need az
 : "${AF_AZ_LOCK_SSH:=1}"
 : "${AF_AZ_IP_URL:=https://api.ipify.org}"
 : "${AF_AZ_IDENTITY_ROLE:=Reader}"
+# Empty by default, and that default matters: most fleets have no Key Vault, and
+# a value here is the only thing that makes provisioning touch one. Either a
+# bare vault name or a full resource id.
+: "${AF_AZ_VAULT:=}"
 
 # Azure demands an admin account at create time; the cloud-init then creates the
 # real, path-mirrored one. The two must not collide.
@@ -107,6 +111,62 @@ az_render_cloud_init() {
   [ -z "$left" ] || af_die "cloud-init for $host still has unsubstituted placeholders: $left"
 }
 
+# A Key Vault is its own RBAC scope. The group-scoped role assignment below does
+# not reach into it, so a machine that can list every resource in the group
+# still gets ForbiddenByRbac reading a secret - an error that reads like a
+# broken login rather than a missing grant, which is how a whole fleet ends up
+# fixed by hand one machine at a time.
+#
+# The role is a constant, not a knob. Read is all a machine needs, and the write
+# role (Key Vault Secrets Officer) on a box running an agent means one confused
+# agent can overwrite every credential the fleet has.
+AZ_VAULT_ROLE="Key Vault Secrets User"
+
+az_grant_vault() {
+  local host="$1" pid="$2" name info scope rbac out try
+  # Accept a full resource id as well as a bare name. The lookup wants the name,
+  # and hands back the canonical scope to assign on.
+  name="${AF_AZ_VAULT##*/}"
+  if ! info="$(az keyvault show -n "$name" --query '[id, properties.enableRbacAuthorization]' -o tsv 2>&1)"; then
+    af_warn "AF_AZ_VAULT is set but vault '$name' could not be read, so $host's identity was NOT granted '$AZ_VAULT_ROLE' and reading a secret there will fail: $(printf '%s' "$info" | tr '\n' ' ')"
+    return 1
+  fi
+  # A list projection in tsv comes back one element per LINE, not as tab
+  # separated columns (checked against a live vault), and a property the vault
+  # does not carry prints as the literal None rather than an empty line.
+  scope="$(printf '%s\n' "$info" | sed -n 1p)"
+  rbac="$(printf '%s\n' "$info" | sed -n 2p)"
+  if [ -z "$scope" ]; then
+    af_warn "AF_AZ_VAULT is set but vault '$name' returned no resource id, so $host's identity was NOT granted '$AZ_VAULT_ROLE'"
+    return 1
+  fi
+  # An access-policy vault ignores role assignments entirely. Say so, then grant
+  # anyway: the assignment is harmless and becomes live the day RBAC is enabled.
+  if [ "$rbac" != true ]; then
+    af_warn "vault $name has RBAC authorization disabled, so it is governed by access policies and this role assignment grants nothing. Add an access policy for $host's identity ($pid), or enable RBAC on the vault."
+  fi
+  for try in 1 2 3; do
+    # --assignee-object-id with an explicit principal type skips the directory
+    # lookup az does on a bare --assignee. A managed identity created seconds
+    # ago is not always replicated yet, and that lookup is what fails.
+    if out="$(az role assignment create --assignee-object-id "$pid" \
+                --assignee-principal-type ServicePrincipal \
+                --role "$AZ_VAULT_ROLE" --scope "$scope" -o none 2>&1)"; then
+      af_log "[azure] $host may read secrets from vault $name ($AZ_VAULT_ROLE)"
+      return 0
+    fi
+    # Only the replication delay is worth waiting out. Missing rights is final,
+    # and retrying it just makes the operator wait for the same warning.
+    case "$out" in
+      *PrincipalNotFound*|*"does not exist in the directory"*|*"graph database"*) sleep 5 ;;
+      *) break ;;
+    esac
+  done
+  af_warn "could not grant '$AZ_VAULT_ROLE' on vault $name to $host's identity (that needs Owner or User Access Administrator). The machine boots fine, but reading a secret from it fails with ForbiddenByRbac. Last error: $(printf '%s' "$out" | tr '\n' ' ')
+  Grant it by hand with: az role assignment create --assignee-object-id $pid --assignee-principal-type ServicePrincipal --role '$AZ_VAULT_ROLE' --scope $scope"
+  return 1
+}
+
 # ---------------------------------------------------------------- interface
 
 provider_list() {
@@ -192,6 +252,12 @@ provider_create() {
     az role assignment create --assignee "$pid" --role "$AF_AZ_IDENTITY_ROLE" \
       --scope "/subscriptions/$sub/resourceGroups/$AF_AZ_GROUP" -o none 2>/dev/null \
       || af_warn "could not grant '$AF_AZ_IDENTITY_ROLE' on $AF_AZ_GROUP to $host's identity (that needs Owner or User Access Administrator). The machine boots fine, but 'az login --identity' on it will have no permissions."
+    # Same warn-and-continue contract as the group grant: assigning roles needs
+    # rights the operator may not have, and a machine without the vault grant is
+    # still a machine, just one whose secret fallback is dead.
+    if [ -n "$AF_AZ_VAULT" ]; then
+      az_grant_vault "$host" "$pid" || true
+    fi
   else
     af_warn "$host has no managed identity, so 'az login --identity' will not work there"
   fi
