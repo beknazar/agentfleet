@@ -664,6 +664,10 @@ function cellsFor(v, st) {
     // spelled out, because git's "dirty" means nothing outside git: files
     // changed on that machine and not yet committed exist only there
     const repo = [v.uncommitted ? `${v.uncommitted} uncommitted` : '', v.ahead ? `${v.ahead} to push` : '', v.behind ? `${v.behind} to pull` : ''].filter(Boolean)
+    // The columns above are comparisons against the machine's last fetch of
+    // origin. The probe keeps that fresh; when it cannot (no network, dead
+    // credentials), say how old the reading is instead of presenting it as now.
+    const fetchNote = (v.fetchAgeSec ?? -1) > 600 ? ` · checked ${Math.round(v.fetchAgeSec / 60)}m ago` : ''
     // Today's model spend on THIS machine, local day. One number; the per-vendor
     // split and token counts live in the tooltip - the column exists to answer
     // "which box is burning money", not to be read to two decimals.
@@ -677,8 +681,8 @@ function cellsFor(v, st) {
       out.cost = `<span class="cost${t >= TUNE.spendHotUsd ? ' hot' : ''}" title="${esc(detail)}">${money(t)}</span>`
     }
     out.repo = repo.length
-      ? `<span class="repo dirty mono" title="changed files that exist only on this machine until they are committed and pushed">${esc(repo.join(' · '))}</span>`
-      : '<span class="quiet">in sync</span>'
+      ? `<span class="repo dirty mono" title="changed files that exist only on this machine until they are committed and pushed">${esc(repo.join(' · ') + fetchNote)}</span>`
+      : (fetchNote ? `<span class="quiet">in sync${esc(fetchNote)}</span>` : '<span class="quiet">in sync</span>')
 
     const svcs = servicesOf(v)
     out.svc = svcs.length

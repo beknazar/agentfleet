@@ -223,6 +223,13 @@ AF_DASH_BIND=tailnet
 # other nine.
 AF_PROBE_TIMEOUT=8
 
+# The dashboard's git columns ("in sync", "N to pull") compare against the
+# machine's last fetch of origin, so the probe refreshes origin at most once
+# per this many seconds. 0 turns the fetch off; the columns then trust
+# whatever last fetched, and say how old that reading is once it passes ten
+# minutes.
+AF_GIT_FETCH_SEC=120
+
 # Web terminal (ttyd) port on each machine, and the port the dashboard's per-row
 # "term" link points at. That link opens in YOUR browser, so it only resolves
 # from a network that can reach the machine directly (a tailnet does; the public

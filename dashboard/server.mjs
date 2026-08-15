@@ -114,7 +114,7 @@ af_load_config
 af_provider_load
 for v in AF_NAME AF_CONFIG AF_USER AF_KEY AF_HOME AF_WORKDIR AF_AGENT AF_SESSION \\
          AF_DASH_PORT AF_DASH_BIND AF_DASH_STALL_SEC AF_DASH_MEM_PCT \\
-         AF_PROBE_TIMEOUT AF_TERM_PORT AF_NOVNC_PORT \\
+         AF_PROBE_TIMEOUT AF_GIT_FETCH_SEC AF_TERM_PORT AF_NOVNC_PORT \\
          AF_BROWSER AF_CDP_PORT AF_MAC_CHROME AF_MAC_CHROME_PORT; do
   eval "printf 'v\\t%s\\t%s\\n' \\"\\$v\\" \\"\\\${$v:-}\\""
 done
@@ -353,6 +353,11 @@ async function inventory(force = false) {
 function buildProbe() {
   const wd = shellSafe('AF_WORKDIR', CFG.AF_WORKDIR)
   const agent = shellSafe('AF_AGENT', CFG.AF_AGENT)
+  // How often a machine may refresh origin for the git columns. Digits only:
+  // anything else (including unset) takes the default, and an explicit 0 turns
+  // the fetch off - the columns then trust whatever the last fetch left.
+  const rawFetchSec = String(CFG.AF_GIT_FETCH_SEC ?? '').trim()
+  const fetchSec = /^\d+$/.test(rawFetchSec) ? Number(rawFetchSec) : 120
   // ${svc} must stay braced: "$svc<key>" would read as one variable name.
   const svc = SERVICES.map(s => s.kind === 'unit'
     ? `if [ "$(systemctl --user is-active ${s.arg} 2>/dev/null)" = active ]; then svc="\${svc}${s.key}:1,"; else svc="\${svc}${s.key}:0,"; fi`
@@ -366,8 +371,27 @@ function buildProbe() {
     // A machine without the work tree still renders; its git columns just read
     // unknown. Hard-failing the whole probe on a missing directory once made a
     // perfectly healthy box look unreachable.
-    'g=""; dirty=""',
+    'g=""; dirty=""; fa=-1',
     `if cd '${wd}' 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then`,
+    // The compare base below is only as fresh as the last fetch, and without
+    // this block nothing on a machine fetches between sync rounds - "in sync"
+    // then means "in sync as of many minutes ago", which is the one thing this
+    // column must never mean. Refresh origin, rate-limited by FETCH_HEAD's age
+    // so the probe adds a network round trip at most once per window. A fetch
+    // only moves remote-tracking refs - never the working tree - so it cannot
+    // disturb whatever the agent is doing; racing another fetcher is settled
+    // by git's ref locking with the loser exiting quietly into `|| true`. The
+    // age is re-read afterwards rather than zeroed, so a fetch that cannot
+    // reach origin leaves the age growing - visible - instead of lying twice.
+    '  gd=$(git rev-parse --git-dir 2>/dev/null); fh="$gd/FETCH_HEAD"',
+    '  [ -f "$fh" ] && fa=$(( $(date +%s) - $(stat -c %Y "$fh" 2>/dev/null || stat -f %m "$fh" 2>/dev/null || echo 0) ))',
+    ...(fetchSec > 0 ? [
+      `  if [ "$fa" -lt 0 ] || [ "$fa" -ge ${fetchSec} ]; then`,
+      '    if command -v timeout >/dev/null 2>&1; then timeout 6 git fetch -q --no-tags origin >/dev/null 2>&1 || true',
+      '    else git fetch -q --no-tags origin >/dev/null 2>&1 || true; fi',
+      '    fa=-1; [ -f "$fh" ] && fa=$(( $(date +%s) - $(stat -c %Y "$fh" 2>/dev/null || stat -f %m "$fh" 2>/dev/null || echo 0) ))',
+      '  fi',
+    ] : []),
     '  base=$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/HEAD)',
     '  g=$(git rev-list --left-right --count "$base"...HEAD 2>/dev/null | tr "\\t" "/")',
     '  dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d " ")',
@@ -408,7 +432,7 @@ function buildProbe() {
     // can contain a pipe), then the cost blob (raw JSON, which can), then one
     // record per tmux session. Giving cost a record of its own is what keeps a
     // "|" inside it from corrupting every field after it.
-    'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\036" "$mem" "$swap" "$load" "$up" "$g" "$dirty" "$svc" "$ap" "$sum" "$sumage"',
+    'printf "%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\\036" "$mem" "$swap" "$load" "$up" "$g" "$dirty" "$svc" "$ap" "$sum" "$sumage" "$fa"',
     'printf "%s\\036" "$cost"',
     'printf "%b" "$sess"',
     // Newlines, not "; ": joining these with a semicolon puts one after `then`
@@ -516,7 +540,7 @@ function unreachableRow(host, err) {
     reachable: false, ...EMPTY_SUMMARY, summarySource: 'none', summaryAgeSec: -1,
     freeGb: null, totalGb: null, memPct: null, swapUsedMb: null,
     load: '', uptimeH: null, sessions: [], agentProcs: null, cost: null,
-    ahead: null, behind: null, uncommitted: null,
+    ahead: null, behind: null, uncommitted: null, fetchAgeSec: null,
     services, ...legacyServiceFlags(services),
     error: flat(err, 200),
   }
@@ -540,7 +564,7 @@ async function probe(host) {
   // RS-separated records, as emitted by buildProbe: scalars, cost JSON, then one
   // record per tmux session.
   const [head = '', costRaw = '', ...sessRecs] = r.out.split(RS)
-  const [mem, swap, load, up, git, dirty, svcRaw, ap, sum, sumage] = head.split('|')
+  const [mem, swap, load, up, git, dirty, svcRaw, ap, sum, sumage, fetchage] = head.split('|')
   let cost = null
   try { const c = JSON.parse(costRaw || '{}'); if (c && typeof c.totalUsd === 'number') cost = c } catch { /* no spend file */ }
 
@@ -575,6 +599,7 @@ async function probe(host) {
     sessions, cost, agentProcs: numOrNull(ap),
     ...s, summarySource: source, summaryAgeSec: numOrNull(sumage) ?? -1,
     ahead, behind, uncommitted: numOrNull(dirty),
+    fetchAgeSec: numOrNull(fetchage) ?? -1,
     services, ...legacyServiceFlags(services),
     error: '',
   }
